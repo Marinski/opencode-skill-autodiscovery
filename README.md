@@ -13,6 +13,8 @@ Skills live in different places depending on the tool that installed them:
   Containers): `~/.vscode-server/agent-plugins/installed.json`,
   `~/.vscode-server-insiders/...`, or `~/.vscode-remote/...`
 - Claude Code plugins: `~/.claude/plugins/installed_plugins.json`
+- Claude Code plugins on a remote host (SSH/remote sessions):
+  `~/.claude/remote/plugins/installed_plugins.json`
 
 Each points at plugin directories that contain `SKILL.md` files. This plugin
 walks those manifests, finds every skill directory, and adds them to the

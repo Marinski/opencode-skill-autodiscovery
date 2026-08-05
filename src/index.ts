@@ -17,12 +17,10 @@ const VSCODE_ROOTS = [
   join(homedir(), ".vscode-remote"),
 ];
 
-const CLAUDE_INSTALLED = join(
-  homedir(),
-  ".claude",
-  "plugins",
-  "installed_plugins.json",
-);
+const CLAUDE_MANIFESTS = [
+  join(homedir(), ".claude", "plugins", "installed_plugins.json"),
+  join(homedir(), ".claude", "remote", "plugins", "installed_plugins.json"),
+];
 
 function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
   const resolved = join(root);
@@ -90,11 +88,11 @@ function collectVscode(out: Set<string>, roots: string[]): void {
   }
 }
 
-function collectClaude(out: Set<string>): void {
-  if (!existsSync(CLAUDE_INSTALLED)) return;
+function collectClaudeManifest(out: Set<string>, installedJson: string): void {
+  if (!existsSync(installedJson)) return;
   let manifest: { plugins?: Record<string, Array<{ installPath?: string }>> };
   try {
-    manifest = JSON.parse(readFileSync(CLAUDE_INSTALLED, "utf8"));
+    manifest = JSON.parse(readFileSync(installedJson, "utf8"));
   } catch {
     return;
   }
@@ -104,6 +102,12 @@ function collectClaude(out: Set<string>): void {
         findSkillDirs(plugin.installPath, out, new Set());
       }
     }
+  }
+}
+
+function collectClaude(out: Set<string>): void {
+  for (const installedJson of CLAUDE_MANIFESTS) {
+    collectClaudeManifest(out, installedJson);
   }
 }
 
