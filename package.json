@@ -1,6 +1,6 @@
 {
   "name": "opencode-skill-autodiscovery",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "OpenCode plugin that auto-discovers skills installed by VS Code agent plugins and Claude Code plugins, and registers them with the local opencode config.",
   "license": "MIT",
   "repository": {

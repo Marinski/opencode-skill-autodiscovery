@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Plugin, Config } from "@opencode-ai/plugin";
 
 type ConfigWithSkills = Config & {
@@ -10,17 +10,49 @@ type ConfigWithSkills = Config & {
   };
 };
 
-const VSCODE_ROOTS = [
-  join(homedir(), ".vscode"),
-  join(homedir(), ".vscode-server"),
-  join(homedir(), ".vscode-server-insiders"),
-  join(homedir(), ".vscode-remote"),
-];
+type CacheEntry = { uri?: string; nonce?: string };
 
-const CLAUDE_MANIFESTS = [
-  join(homedir(), ".claude", "plugins", "installed_plugins.json"),
-  join(homedir(), ".claude", "remote", "plugins", "installed_plugins.json"),
-];
+// VS Code keeps agent plugins in a per-platform "data dir". The holding
+// folder is named `agent-plugins` on older builds (e.g. ~/.vscode) and
+// `agentPlugins` on newer builds; remote servers nest theirs under `data/`
+// (~/.vscode-server/data/agentPlugins). We list every known candidate so the
+// discovery works regardless of OS, build channel, or local/remote setup.
+function vsCodeDataRoots(extra: string[]): string[] {
+  const home = homedir();
+  const roots = new Set<string>([
+    join(home, ".vscode"),
+    // Linux
+    join(home, ".config", "Code"),
+    join(home, ".config", "Code - Insiders"),
+    // macOS
+    join(home, "Library", "Application Support", "Code"),
+    join(home, "Library", "Application Support", "Code - Insiders"),
+    // Windows
+    ...(process.env.APPDATA
+      ? [
+          join(process.env.APPDATA, "Code"),
+          join(process.env.APPDATA, "Code - Insiders"),
+        ]
+      : []),
+    // Remote hosts (Remote-SSH, Dev Containers, Codespaces, WSL)
+    join(home, ".vscode-server"),
+    join(home, ".vscode-server-insiders"),
+    join(home, ".vscode-remote"),
+  ]);
+  for (const root of extra) roots.add(root);
+  return [...roots];
+}
+
+function agentPluginDirs(roots: string[]): string[] {
+  const dirs = new Set<string>();
+  for (const root of roots) {
+    dirs.add(join(root, "agent-plugins"));
+    dirs.add(join(root, "agentPlugins"));
+    dirs.add(join(root, "data", "agent-plugins"));
+    dirs.add(join(root, "data", "agentPlugins"));
+  }
+  return [...dirs];
+}
 
 function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
   const resolved = join(root);
@@ -33,6 +65,7 @@ function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
     return;
   }
   for (const entry of entries) {
+    if (entry === ".git") continue;
     const full = join(resolved, entry);
     let isDir = false;
     try {
@@ -78,13 +111,60 @@ function collectVscodeManifest(out: Set<string>, installedJson: string): void {
   }
 }
 
-function collectVscode(out: Set<string>, roots: string[]): void {
-  for (const root of roots) {
-    collectVscodeManifest(out, join(root, "agent-plugins", "installed.json"));
-    collectVscodeManifest(
-      out,
-      join(root, "data", "agent-plugins", "installed.json"),
-    );
+// Remote hosts: VS Code syncs client skills into
+// {data}/agentPlugins/{sanitizedUri}/{nonce}/ and records the LRU in
+// cache.json. Resolve each entry so the materialized synced-customization
+// bundle ("VS Code Synced Data" Open Plugin, skills/<name>/SKILL.md) is
+// discovered.
+function collectVscodeCache(out: Set<string>, cacheJson: string): void {
+  if (!existsSync(cacheJson)) return;
+  let entries: CacheEntry[];
+  try {
+    entries = JSON.parse(readFileSync(cacheJson, "utf8"));
+  } catch {
+    return;
+  }
+  if (!Array.isArray(entries)) return;
+  const parent = dirname(cacheJson);
+  for (const entry of entries) {
+    if (typeof entry?.uri !== "string") continue;
+    const key = sanitizeKey(entry.uri) || "default";
+    const nonce =
+      typeof entry.nonce === "string" && entry.nonce
+        ? sanitizeKey(entry.nonce)
+        : "default";
+    findSkillDirs(join(parent, key, nonce), out, new Set());
+  }
+}
+
+// Mirrors the server-side AgentPluginManager sanitizer so we can resolve the
+// cache.json entries to their on-disk directories.
+function sanitizeKey(value: string): string {
+  return value
+    .replace(/[^a-zA-Z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .substring(0, 128);
+}
+
+function collectAgentPluginRoot(out: Set<string>, root: string): void {
+  const installedJson = join(root, "installed.json");
+  const cacheJson = join(root, "cache.json");
+  const hasManifest = existsSync(installedJson) || existsSync(cacheJson);
+  collectVscodeManifest(out, installedJson);
+  collectVscodeCache(out, cacheJson);
+  // Newer VS Code installs marketplaces directly as {host}/{org}/{repo}
+  // subdirectories with no manifest file at all. Fall back to a full tree walk
+  // only when no metadata exists, so we don't surface skills from cloned-but-
+  // not-installed marketplaces on setups that do have a manifest.
+  if (!hasManifest) {
+    findSkillDirs(root, out, new Set());
+  }
+}
+
+function collectVscode(out: Set<string>, extra: string[]): void {
+  for (const dir of agentPluginDirs(vsCodeDataRoots(extra))) {
+    collectAgentPluginRoot(out, dir);
   }
 }
 
@@ -106,7 +186,11 @@ function collectClaudeManifest(out: Set<string>, installedJson: string): void {
 }
 
 function collectClaude(out: Set<string>): void {
-  for (const installedJson of CLAUDE_MANIFESTS) {
+  const home = homedir();
+  for (const installedJson of [
+    join(home, ".claude", "plugins", "installed_plugins.json"),
+    join(home, ".claude", "remote", "plugins", "installed_plugins.json"),
+  ]) {
     collectClaudeManifest(out, installedJson);
   }
 }
@@ -115,10 +199,9 @@ export default (async (_input, options) => {
   return {
     config: async (cfg: Config) => {
       const config = cfg as ConfigWithSkills;
-      const roots = VSCODE_ROOTS;
       const extra = Array.isArray(options?.extraRoots) ? options.extraRoots : [];
       const dirs = new Set<string>();
-      collectVscode(dirs, [...roots, ...extra]);
+      collectVscode(dirs, extra);
       collectClaude(dirs);
       if (dirs.size === 0) return;
       const seen = new Set<string>();
