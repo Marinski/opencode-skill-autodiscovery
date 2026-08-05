@@ -12,6 +12,30 @@ type ConfigWithSkills = Config & {
 
 type CacheEntry = { uri?: string; nonce?: string };
 
+type SkillInfo = { dir: string; name: string; description: string };
+
+// Parses the YAML frontmatter of a SKILL.md (name, description). Returns null
+// when the file is unreadable or lacks a valid `name`.
+function readSkillInfo(dir: string): SkillInfo | null {
+  const skillMd = join(dir, "SKILL.md");
+  let content: string;
+  try {
+    content = readFileSync(skillMd, "utf8");
+  } catch {
+    return null;
+  }
+  const frontmatter = /^---\s*\n([\s\S]*?)\n---/.exec(content)?.[1];
+  if (!frontmatter) return null;
+  const field = (key: string): string | undefined => {
+    const m = new RegExp(`^${key}:[ \\t]*(.*)$`, "m").exec(frontmatter);
+    if (!m) return undefined;
+    return m[1].trim().replace(/^["']|["']$/g, "");
+  };
+  const name = field("name");
+  if (!name) return null;
+  return { dir, name, description: field("description") ?? "" };
+}
+
 // VS Code keeps agent plugins in a per-platform "data dir". The holding
 // folder is named `agent-plugins` on older builds (e.g. ~/.vscode) and
 // `agentPlugins` on newer builds; remote servers nest theirs under `data/`
@@ -235,6 +259,24 @@ export default (async (_input, options) => {
         if (!config.skills.paths.includes(dir)) {
           config.skills.paths.push(dir);
         }
+      }
+      // Expose each discovered skill as a `/name` slash command. opencode
+      // treats skills and commands as separate mechanisms: a skill is only
+      // loaded via the `skill` tool, so without this a discovered skill is
+      // never invocable as `/name`. The command body tells the agent to load
+      // the skill and route the user's arguments through it.
+      config.command ??= {};
+      for (const dir of unique) {
+        const info = readSkillInfo(dir);
+        if (!info) continue;
+        if (config.command[info.name]) continue;
+        config.command[info.name] = {
+          description: info.description || `Run the ${info.name} skill`,
+          template: [
+            `Load the \`${info.name}\` skill and follow its instructions.`,
+            `Context: $ARGUMENTS`,
+          ].join("\n"),
+        };
       }
     },
   };

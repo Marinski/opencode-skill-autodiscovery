@@ -3,6 +3,8 @@
 An [opencode](https://opencode.ai) plugin that auto-discovers skills installed by
 VS Code agent plugins and Claude Code plugins on the current machine, and
 registers them with opencode's `skills.paths` so they appear in every session.
+Each discovered skill is also exposed as a `/skill-name` slash command that
+loads the skill and routes the rest of your message through it.
 
 ## Why
 
@@ -28,6 +30,22 @@ setup:
 Each points at plugin directories that contain `SKILL.md` files. This plugin
 reads the manifests (including the remote `cache.json` LRU), resolves each
 entry to its on-disk skill directories, and registers them with opencode.
+
+### Slash commands
+
+opencode treats skills and slash commands as separate mechanisms: skills are
+only loaded on demand via the `skill` tool. To make a discovered skill
+invocable as `/name`, the plugin also registers a command for it (via
+`config.command`) whose template loads the skill and forwards your arguments:
+
+```markdown
+Load the `spec` skill and follow its instructions.
+Context: $ARGUMENTS
+```
+
+So `/spec plan the migration` loads the `spec` skill and runs it against
+`plan the migration`. The command's description is taken from the skill's
+frontmatter; existing commands with the same name are left untouched.
 
 ## Install
 
