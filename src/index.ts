@@ -134,6 +134,9 @@ function collectVscodeCache(out: Set<string>, cacheJson: string): void {
         ? sanitizeKey(entry.nonce)
         : "default";
     findSkillDirs(join(parent, key, nonce), out, new Set());
+    // Some remote builds materialize the synced bundle directly as
+    // {parent}/{key}/skills/... without the {nonce} subdirectory.
+    findSkillDirs(join(parent, key), out, new Set());
   }
 }
 
@@ -187,11 +190,25 @@ function collectClaudeManifest(out: Set<string>, installedJson: string): void {
 
 function collectClaude(out: Set<string>): void {
   const home = homedir();
-  for (const installedJson of [
+  const installedJsons = [
     join(home, ".claude", "plugins", "installed_plugins.json"),
     join(home, ".claude", "remote", "plugins", "installed_plugins.json"),
-  ]) {
-    collectClaudeManifest(out, installedJson);
+  ];
+  let found = false;
+  for (const installedJson of installedJsons) {
+    if (existsSync(installedJson)) {
+      found = true;
+      collectClaudeManifest(out, installedJson);
+    }
+  }
+  // Remote hosts sync Claude plugins as {nonce}/ dirs with per-plugin
+  // manifest.json but no installed_plugins.json; tree-walk the remote plugins
+  // dir as a fallback so those skills are discovered too.
+  if (!found) {
+    const remoteRoot = join(home, ".claude", "remote", "plugins");
+    if (existsSync(remoteRoot)) {
+      findSkillDirs(remoteRoot, out, new Set());
+    }
   }
 }
 
