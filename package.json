@@ -1,0 +1,46 @@
+{
+  "name": "opencode-skill-autodiscovery",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that auto-discovers skills installed by VS Code agent plugins and Claude Code plugins, and registers them with the local opencode config.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Marinski/opencode-skill-autodiscovery.git"
+  },
+  "homepage": "https://github.com/Marinski/opencode-skill-autodiscovery",
+  "bugs": {
+    "url": "https://github.com/Marinski/opencode-skill-autodiscovery/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "skill",
+    "autodiscovery",
+    "claude",
+    "vscode"
+  ],
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.13",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0"
+  }
+}
