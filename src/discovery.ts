@@ -486,6 +486,24 @@ export function collectNodeModules(
 
 // --- Merge logic ------------------------------------------------------------
 
+// Collapses mirrors of the same conformant package discovered from several
+// places at once (opencode cache + project node_modules + VS Code clone +
+// synced bundle). Conformant packages are identified by their manifest name;
+// legacy packages fall back to source + root, which is unique per location.
+function dedupePackages(packages: PluginPackage[]): PluginPackage[] {
+  const seen = new Set<string>();
+  const out: PluginPackage[] = [];
+  for (const pkg of packages) {
+    const id = pkg.schemaVersion
+      ? `conformant:${pkg.name}`
+      : `${pkg.source}\u0000${pkg.root}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(pkg);
+  }
+  return out;
+}
+
 // Computes the config contribution from the discovered packages: every unique
 // skill path, slash commands keyed by frontmatter name with collisions
 // namespaced by package name, and MCP servers keyed by server name with
@@ -499,6 +517,7 @@ export function planConfig(
     agents?: Iterable<string>;
   } = {},
 ): ConfigPatch {
+  packages = dedupePackages(packages);
   const skillPaths: string[] = [];
   const seenDir = new Set<string>();
   for (const pkg of packages) {

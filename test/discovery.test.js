@@ -780,3 +780,34 @@ test("planConfig: same-source agent mirrors are not duplicated", () => {
     cleanup(root);
   }
 });
+
+test("planConfig: collapses the same conformant package across sources", () => {
+  const root = makeTemp();
+  try {
+    const build = (dir) => {
+      mkdirSync(join(dir, "skills", "s"), { recursive: true });
+      writeFileSync(join(dir, "skills", "s", "SKILL.md"), "---\nname: s\n---\n");
+      writeFileSync(
+        join(dir, "plugin.json"),
+        JSON.stringify({
+          $schema: SCHEMA,
+          name: "dotest",
+          extensions: { "dev.opencode": { agents: { reviewer: { description: "R" } } } },
+        }),
+      );
+    };
+    const cacheDir = join(root, "cache");
+    const nmDir = join(root, "node_modules");
+    build(cacheDir);
+    build(nmDir);
+    const cache = readPackage(cacheDir, "opencode-cache");
+    const nm = readPackage(nmDir, "node_modules");
+    const plan = planConfig([cache, nm]);
+    // Same package name across sources: one agent, one skill path, one command.
+    assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
+    assert.equal(plan.skillPaths.length, 1);
+    assert.deepEqual(plan.commands.map((c) => c.name), ["s"]);
+  } finally {
+    cleanup(root);
+  }
+});
