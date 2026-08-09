@@ -10,14 +10,20 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  applyConfigPatch,
+  collectClaudeManifest,
   collectNodeModules,
   collectOpencodeCache,
+  collectVscodeCache,
+  collectVscodeManifest,
   contains,
   packageFromDir,
   planConfig,
+  readAgents,
   readMcp,
   readPackage,
 } from "../dist/discovery.js";
+import { sanitize } from "../dist/log.js";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 const MCP_SCHEMA_URL = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
@@ -452,6 +458,324 @@ test("planConfig: same-source MCP mirrors are not duplicated", () => {
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "node_modules");
     const plan = planConfig([a, b]);
     assert.deepEqual(plan.mcp.map((m) => m.key), ["shared"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readPackage: rejects names that violate the manifest name constraints", () => {
+  const root = makeTemp();
+  try {
+    const invalid = ["My-Plugin", "-start", "trailing-", "has--double", "too.many..dots", "a".repeat(65)];
+    invalid.forEach((name, i) => {
+      const dir = join(root, `bad-${i}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name }));
+      assert.equal(readPackage(dir, "node_modules"), null, `expected "${name}" to be rejected`);
+    });
+    const valid = ["my-plugin", "acme.tools", "lint3r", "a"];
+    valid.forEach((name, i) => {
+      const dir = join(root, `good-${i}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name }));
+      assert.ok(readPackage(dir, "node_modules"), `expected "${name}" to be accepted`);
+    });
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: rejects non-http(s) urls for remote transports", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        bad: { type: "streamable-http", url: "file:///etc/passwd" },
+        good: { type: "streamable-http", url: "https://api.example.com/mcp" },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+    const out = [];
+    readMcp(pkg, out);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, "good");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectClaudeManifest: resolves installPaths from installed_plugins.json", () => {
+  const root = makeTemp();
+  try {
+    const pluginDir = makePackage(join(root, "plugins", "cache", "org", "repo"), "alpha", ["s"]);
+    const manifestPath = join(root, "installed_plugins.json");
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({ plugins: { "org/repo": [{ installPath: pluginDir }] } }),
+    );
+    const out = [];
+    collectClaudeManifest(out, manifestPath);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].name, "alpha");
+    assert.equal(out[0].skillDirs.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: resolves pluginUri entries from installed.json", () => {
+  const root = makeTemp();
+  try {
+    const pluginDir = makePackage(join(root, "github.com", "org", "repo"), "beta", ["t"]);
+    const manifestPath = join(root, "installed.json");
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${pluginDir.replace(/\\/g, "/")}` }],
+      }),
+    );
+    const out = [];
+    collectVscodeManifest(out, manifestPath);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].name, "beta");
+    assert.equal(out[0].skillDirs.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeCache: resolves synced bundles with and without a nonce subdir", () => {
+  const root = makeTemp();
+  try {
+    const agentPlugins = join(root, "data", "agentPlugins");
+    mkdirSync(agentPlugins, { recursive: true });
+    makePackage(join(agentPlugins, "vscode-synced-some", "abc123"), "synced", ["s1"]);
+    makePackage(join(agentPlugins, "vscode-synced-other"), "synced2", ["s2"]);
+    writeFileSync(
+      join(agentPlugins, "cache.json"),
+      JSON.stringify([
+        { uri: "vscode://synced/some", nonce: "abc123" },
+        { uri: "vscode://synced/other" },
+      ]),
+    );
+    const out = [];
+    collectVscodeCache(out, join(agentPlugins, "cache.json"));
+    const names = out.map((p) => p.name);
+    assert.ok(names.includes("synced"), "with-nonce bundle discovered");
+    assert.ok(names.includes("synced2"), "without-nonce bundle discovered");
+    // The with-nonce bundle must not be discovered twice via the {key} walk.
+    assert.equal(out.filter((p) => p.name === "synced").length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("sanitize: strips ANSI escapes and control characters", () => {
+  assert.equal(sanitize("hello\u001b[31mred\u001b[0m world"), "hellored world");
+  assert.equal(sanitize("a\u0007b\u001fc"), "abc");
+});
+
+test("applyConfigPatch: merges without overwriting user entries", () => {
+  const plan = {
+    skillPaths: ["/a/s1", "/a/s2"],
+    commands: [
+      { name: "s1", description: "S1", template: "T1" },
+      { name: "s2", description: "S2", template: "T2" },
+    ],
+    mcp: [{ key: "m", entry: { type: "remote", url: "https://x", enabled: true } }],
+    agents: [{ name: "a1", agent: { description: "A1" } }],
+  };
+  const cfg = {
+    skills: { paths: ["/a/s1"] },
+    command: { s1: { template: "user-template" } },
+    mcp: undefined,
+    agent: { a1: { description: "user agent" } },
+  };
+  applyConfigPatch(cfg, plan, { mcp: true, agents: true });
+  // Duplicate path already present is not re-added.
+  assert.deepEqual(cfg.skills.paths, ["/a/s1", "/a/s2"]);
+  assert.equal(cfg.command.s1.template, "user-template");
+  assert.equal(cfg.command.s2.template, "T2");
+  assert.deepEqual(cfg.mcp.m, { type: "remote", url: "https://x", enabled: true });
+  assert.equal(cfg.agent.a1.description, "user agent");
+});
+
+test("applyConfigPatch: no-op when nothing found and opt-ins disabled", () => {
+  const cfg = { skills: { paths: ["/user"] } };
+  applyConfigPatch(
+    cfg,
+    { skillPaths: [], commands: [], mcp: [], agents: [{ name: "a", agent: { description: "A" } }] },
+    { mcp: false, agents: false },
+  );
+  assert.deepEqual(cfg.skills.paths, ["/user"]);
+  assert.equal(cfg.command, undefined);
+  assert.equal(cfg.agent, undefined);
+});
+
+test("applyConfigPatch: does not create command/mcp/agent objects when empty", () => {
+  const cfg = {};
+  applyConfigPatch(
+    cfg,
+    { skillPaths: ["/a"], commands: [], mcp: [], agents: [] },
+    { mcp: true, agents: true },
+  );
+  assert.deepEqual(cfg.skills.paths, ["/a"]);
+  assert.equal(cfg.command, undefined);
+  assert.equal(cfg.mcp, undefined);
+  assert.equal(cfg.agent, undefined);
+});
+
+test("applyConfigPatch: registers agents only when the agents opt-in is enabled", () => {
+  const plan = {
+    skillPaths: [],
+    commands: [],
+    mcp: [],
+    agents: [{ name: "reviewer", agent: { description: "Reviews diffs" } }],
+  };
+  const off = {};
+  applyConfigPatch(off, plan, { mcp: false, agents: false });
+  assert.equal(off.agent, undefined);
+  const on = {};
+  applyConfigPatch(on, plan, { mcp: false, agents: true });
+  assert.deepEqual(on.agent.reviewer, { description: "Reviews diffs" });
+});
+
+test("readAgents: reads dev.opencode manifest agents and strips permission", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: {
+              reviewer: {
+                description: "Reviews diffs",
+                prompt: "You review code",
+                mode: "subagent",
+                permission: { edit: "allow" },
+                bogus: 123,
+              },
+              broken: {},
+            },
+          },
+        },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "reviewer");
+    assert.deepEqual(agents[0].agent, {
+      description: "Reviews diffs",
+      prompt: "You review code",
+      mode: "subagent",
+    });
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: reads dev.opencode/agents/<name>.json extension directory", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "dev.opencode", "agents"), { recursive: true });
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    writeFileSync(
+      join(pkgDir, "dev.opencode", "agents", "triage.json"),
+      JSON.stringify({ description: "Triages issues", prompt: "You triage" }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "triage");
+    assert.equal(agents[0].agent.prompt, "You triage");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: reads Claude Code plugin agents shim with AGENTS.md fallback", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "legacy");
+    mkdirSync(join(pkgDir, ".claude-plugin"), { recursive: true });
+    mkdirSync(join(pkgDir, "agents", "explorer"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "legacy",
+        agents: {
+          explorer: { description: "Explores the codebase" },
+        },
+      }),
+    );
+    writeFileSync(join(pkgDir, "agents", "explorer", "AGENTS.md"), "# Explorer\n\nFind things.\n");
+    const pkg = packageFromDir(pkgDir, "node_modules");
+    assert.ok(pkg, "agents-only plugin is discovered");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "explorer");
+    assert.equal(agents[0].agent.description, "Explores the codebase");
+    assert.equal(agents[0].agent.prompt, "# Explorer\n\nFind things.\n");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig: namespaces agent collisions across distinct sources", () => {
+  const root = makeTemp();
+  try {
+    const manifest = {
+      $schema: SCHEMA,
+      name: "alpha",
+      extensions: { "dev.opencode": { agents: { reviewer: { description: "R" } } } },
+    };
+    const aDir = join(root, "a");
+    mkdirSync(aDir, { recursive: true });
+    writeFileSync(join(aDir, "plugin.json"), JSON.stringify(manifest));
+    const bDir = join(root, "b");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(
+      join(bDir, "plugin.json"),
+      JSON.stringify({ ...manifest, name: "beta" }),
+    );
+    const a = readPackage(aDir, "node_modules");
+    const b = readPackage(bDir, "opencode-cache");
+    const plan = planConfig([a, b]);
+    assert.deepEqual(
+      plan.agents.map((x) => x.name).sort(),
+      ["beta-reviewer", "reviewer"],
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig: same-source agent mirrors are not duplicated", () => {
+  const root = makeTemp();
+  try {
+    const manifest = (name) => ({
+      $schema: SCHEMA,
+      name,
+      extensions: { "dev.opencode": { agents: { reviewer: { description: "R" } } } },
+    });
+    const aDir = join(root, "a");
+    mkdirSync(aDir, { recursive: true });
+    writeFileSync(join(aDir, "plugin.json"), JSON.stringify(manifest("alpha")));
+    const bDir = join(root, "b");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(join(bDir, "plugin.json"), JSON.stringify(manifest("beta")));
+    const a = readPackage(aDir, "node_modules");
+    const b = readPackage(bDir, "node_modules");
+    const plan = planConfig([a, b]);
+    assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
   } finally {
     cleanup(root);
   }

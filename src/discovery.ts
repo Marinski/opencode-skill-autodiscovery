@@ -1,6 +1,5 @@
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -8,6 +7,17 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { log } from "./log.js";
+import { readAgents } from "./agents.js";
+import { readMcp } from "./mcp.js";
+import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION } from "./schema.js";
+import type { AgentConfig } from "./agents.js";
+import type { McpEntry } from "./mcp.js";
+
+export { readAgents } from "./agents.js";
+export type { AgentConfig } from "./agents.js";
+export { readMcp } from "./mcp.js";
+export type { McpEntry } from "./mcp.js";
 
 export type PackageSource =
   | "claude"
@@ -28,38 +38,19 @@ export type PluginPackage = {
 
 export type SkillInfo = { dir: string; name: string; description: string };
 
-export type McpEntry =
-  | {
-      type: "local";
-      command: string[];
-      environment?: Record<string, string>;
-      enabled?: boolean;
-    }
-  | {
-      type: "remote";
-      url: string;
-      headers?: Record<string, string>;
-      enabled?: boolean;
-    };
-
 export type ConfigPatch = {
   skillPaths: string[];
   commands: Array<{ name: string; description: string; template: string }>;
   mcp: Array<{ key: string; entry: McpEntry }>;
+  agents: Array<{ name: string; agent: AgentConfig }>;
 };
 
-const PLUGIN_SCHEMA =
-  /^https:\/\/agent-plugins\.org\/schemas\/1\.\d+\.\d+\/plugin\.schema\.json$/;
-const MCP_SCHEMA =
-  /^https:\/\/agent-plugins\.org\/schemas\/1\.\d+\.\d+\/mcp\.schema\.json$/;
-const VERSION = /^https:\/\/agent-plugins\.org\/schemas\/(\d+\.\d+\.\d+)\//;
-
-const STDIO_KEYS = new Set(["type", "command", "args", "env", "cwd"]);
-const HTTP_KEYS = new Set(["type", "url", "headers"]);
-
-export function log(message: string): void {
-  console.error(`[opencode-skill-autodiscovery] ${message}`);
-}
+export type ConfigLike = {
+  skills?: { paths?: string[] };
+  command?: Record<string, { description?: string; template: string }>;
+  mcp?: Record<string, McpEntry>;
+  agent?: Record<string, AgentConfig | undefined>;
+};
 
 function isDirectory(p: string): boolean {
   try {
@@ -110,8 +101,8 @@ export function readSkillInfo(dir: string): SkillInfo | null {
 
 // Reads a conformant Agent Plugins 1.0.0 package from a directory root.
 // Returns null when the root has no valid plugin.json, so callers can fall
-// back to legacy discovery. The $schema URL is the discriminator that makes
-// scanning untrusted directories safe.
+// back to legacy discovery. The $schema URL and the manifest name are the
+// discriminators that make scanning untrusted directories safe.
 export function readPackage(
   root: string,
   source: PackageSource,
@@ -128,7 +119,12 @@ export function readPackage(
   if (typeof manifest.$schema !== "string" || !PLUGIN_SCHEMA.test(manifest.$schema)) {
     return null;
   }
-  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+  if (
+    typeof manifest.name !== "string" ||
+    manifest.name.length === 0 ||
+    manifest.name.length > 64 ||
+    !NAME_PATTERN.test(manifest.name)
+  ) {
     return null;
   }
 
@@ -193,6 +189,25 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
   }
 }
 
+// True when a legacy Claude Code plugin declares at least one agent, so an
+// agents-only plugin is still discovered even though it ships no skills.
+function hasClaudeAgents(root: string): boolean {
+  try {
+    const manifest: unknown = JSON.parse(
+      readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"),
+    );
+    if (typeof manifest !== "object" || manifest === null) return false;
+    const agents = (manifest as Record<string, unknown>).agents;
+    return (
+      typeof agents === "object" &&
+      agents !== null &&
+      Object.keys(agents).length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Prefers a conformant package manifest; falls back to a legacy tree walk so
 // non-conformant layouts keep working. Returns null when nothing is found.
 export function packageFromDir(
@@ -203,7 +218,7 @@ export function packageFromDir(
   if (pkg) return pkg;
   const skillDirs = new Set<string>();
   findSkillDirs(root, skillDirs, new Set());
-  if (skillDirs.size === 0) return null;
+  if (skillDirs.size === 0 && !hasClaudeAgents(root)) return null;
   return {
     source,
     name: root.split(/[\\/]/).pop() || root,
@@ -269,7 +284,7 @@ function vscodePluginPath(pluginUri: string): string | null {
   return raw;
 }
 
-function collectVscodeManifest(
+export function collectVscodeManifest(
   out: PluginPackage[],
   installedJson: string,
 ): void {
@@ -297,7 +312,7 @@ type CacheEntry = { uri?: string; nonce?: string };
 // cache.json. Resolve each entry so the materialized synced-customization
 // bundle ("VS Code Synced Data" Open Plugin, skills/<name>/SKILL.md) is
 // discovered.
-function collectVscodeCache(out: PluginPackage[], cacheJson: string): void {
+export function collectVscodeCache(out: PluginPackage[], cacheJson: string): void {
   if (!existsSync(cacheJson)) return;
   let entries: CacheEntry[];
   try {
@@ -314,8 +329,15 @@ function collectVscodeCache(out: PluginPackage[], cacheJson: string): void {
       typeof entry.nonce === "string" && entry.nonce
         ? sanitizeKey(entry.nonce)
         : "default";
-    for (const dir of [join(parent, key, nonce), join(parent, key)]) {
-      const pkg = packageFromDir(dir, "vscode");
+    const nonceDir = join(parent, key, nonce);
+    if (isDirectory(nonceDir)) {
+      const pkg = packageFromDir(nonceDir, "vscode");
+      if (pkg) out.push(pkg);
+    } else {
+      // Layouts without the {nonce} subdirectory materialize the bundle
+      // directly under {key}; walking it only when the nonce dir is absent
+      // avoids re-descending into it.
+      const pkg = packageFromDir(join(parent, key), "vscode");
       if (pkg) out.push(pkg);
     }
   }
@@ -355,7 +377,7 @@ export function collectVscode(out: PluginPackage[], extra: string[]): void {
 
 // --- Claude Code plugin discovery ------------------------------------------
 
-function collectClaudeManifest(
+export function collectClaudeManifest(
   out: PluginPackage[],
   installedJson: string,
 ): void {
@@ -382,22 +404,18 @@ export function collectClaude(out: PluginPackage[]): void {
     join(home, ".claude", "plugins", "installed_plugins.json"),
     join(home, ".claude", "remote", "plugins", "installed_plugins.json"),
   ];
-  let found = false;
   for (const installedJson of installedJsons) {
     if (existsSync(installedJson)) {
-      found = true;
       collectClaudeManifest(out, installedJson);
     }
   }
-  // Remote hosts sync Claude plugins as {nonce}/ dirs with per-plugin
-  // manifest.json but no installed_plugins.json; tree-walk the remote plugins
-  // dir as a fallback so those skills are discovered too.
-  if (!found) {
-    const remoteRoot = join(home, ".claude", "remote", "plugins");
-    if (existsSync(remoteRoot)) {
-      const pkg = packageFromDir(remoteRoot, "claude");
-      if (pkg) out.push(pkg);
-    }
+  // Always scan the SSH-synced remote bundle too: it can exist alongside a
+  // local Claude Code install that has its own installed_plugins.json, and
+  // the same-source mirror dedup in planConfig collapses any overlap.
+  const remoteRoot = join(home, ".claude", "remote", "plugins");
+  if (existsSync(remoteRoot)) {
+    const pkg = packageFromDir(remoteRoot, "claude");
+    if (pkg) out.push(pkg);
   }
 }
 
@@ -466,171 +484,6 @@ export function collectNodeModules(
   }
 }
 
-// --- MCP servers (mcp.json) -------------------------------------------------
-
-function opencodeStateRoot(): string {
-  const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
-  return join(base, "opencode");
-}
-
-export function pluginDataRoot(name: string): string {
-  return join(opencodeStateRoot(), "plugin-data", name);
-}
-
-function expandPluginVars(value: string, root: string, dataDir: string): string {
-  return value
-    .split("${PLUGIN_ROOT}")
-    .join(root)
-    .split("${PLUGIN_DATA}")
-    .join(dataDir);
-}
-
-function collectHeaders(value: unknown): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (typeof value === "object" && value !== null) {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof v === "string") headers[k] = v;
-    }
-  }
-  return headers;
-}
-
-function hasUnknownKeys(
-  server: Record<string, unknown>,
-  allowed: Set<string>,
-): boolean {
-  return Object.keys(server).some((k) => !allowed.has(k));
-}
-
-// Maps the portable mcp.json shape onto opencode's native config.mcp. Per the
-// Agent Plugins spec, failures are per-entry (and per-package for an invalid
-// mcp.json): a bad server never blocks other servers or the package's skills.
-export function readMcp(
-  pkg: PluginPackage,
-  out: Array<{ key: string; entry: McpEntry }>,
-): void {
-  if (!pkg.mcpPath) return;
-  let raw: string;
-  try {
-    raw = readFileSync(pkg.mcpPath, "utf8");
-  } catch {
-    return;
-  }
-  let parsed: { $schema?: unknown; mcpServers?: unknown };
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    log(`ignoring mcp.json for package "${pkg.name}": not valid JSON`);
-    return;
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    log(`ignoring mcp.json for package "${pkg.name}": not an object`);
-    return;
-  }
-  if (typeof parsed.$schema !== "string" || !MCP_SCHEMA.test(parsed.$schema)) {
-    log(`ignoring mcp.json for package "${pkg.name}": unsupported or missing $schema`);
-    return;
-  }
-  const mcpVersion = VERSION.exec(parsed.$schema)?.[1];
-  if (pkg.schemaVersion && mcpVersion && mcpVersion !== pkg.schemaVersion) {
-    log(
-      `ignoring mcp.json for package "${pkg.name}": schema version ${mcpVersion} does not match plugin.json (${pkg.schemaVersion})`,
-    );
-    return;
-  }
-  if (typeof parsed.mcpServers !== "object" || parsed.mcpServers === null) {
-    log(`ignoring mcp.json for package "${pkg.name}": missing mcpServers`);
-    return;
-  }
-
-  const dataDir = pluginDataRoot(pkg.name);
-  const servers = parsed.mcpServers as Record<string, unknown>;
-  for (const [name, serverValue] of Object.entries(servers)) {
-    if (typeof serverValue !== "object" || serverValue === null) {
-      log(`skipping MCP server "${pkg.name}/${name}": invalid entry`);
-      continue;
-    }
-    const server = serverValue as Record<string, unknown>;
-
-    if (server.type === "stdio") {
-      if (hasUnknownKeys(server, STDIO_KEYS)) {
-        log(`skipping MCP server "${pkg.name}/${name}": unknown fields in stdio entry`);
-        continue;
-      }
-      if (typeof server.command !== "string" || server.command.length === 0) {
-        log(`skipping MCP server "${pkg.name}/${name}": stdio requires a string command`);
-        continue;
-      }
-      const command = server.command.startsWith("./")
-        ? join(pkg.root, server.command)
-        : server.command;
-      const args = Array.isArray(server.args)
-        ? server.args
-            .filter((a): a is string => typeof a === "string")
-            .map((a) => expandPluginVars(a, pkg.root, dataDir))
-        : [];
-      const environment: Record<string, string> = {};
-      if (typeof server.env === "object" && server.env !== null) {
-        for (const [k, v] of Object.entries(
-          server.env as Record<string, unknown>,
-        )) {
-          if (k === "PLUGIN_ROOT" || k === "PLUGIN_DATA") {
-            log(`dropping reserved env key "${k}" for MCP server "${pkg.name}/${name}"`);
-            continue;
-          }
-          if (typeof v === "string") {
-            environment[k] = expandPluginVars(v, pkg.root, dataDir);
-          }
-        }
-      }
-      environment.PLUGIN_ROOT = pkg.root;
-      environment.PLUGIN_DATA = dataDir;
-      if (server.cwd !== undefined) {
-        const cwd =
-          typeof server.cwd === "string"
-            ? expandPluginVars(server.cwd, pkg.root, dataDir)
-            : String(server.cwd);
-        log(`dropping cwd "${cwd}" for MCP server "${pkg.name}/${name}": opencode has no cwd support`);
-      }
-      try {
-        mkdirSync(dataDir, { recursive: true });
-      } catch {
-        // Non-fatal: the subprocess env still points at the (uncreated) dir.
-      }
-      out.push({
-        key: name,
-        entry: { type: "local", command: [command, ...args], environment, enabled: true },
-      });
-    } else if (server.type === "streamable-http") {
-      if (hasUnknownKeys(server, HTTP_KEYS)) {
-        log(`skipping MCP server "${pkg.name}/${name}": unknown fields in streamable-http entry`);
-        continue;
-      }
-      if (typeof server.url !== "string" || server.url.length === 0) {
-        log(`skipping MCP server "${pkg.name}/${name}": streamable-http requires a string url`);
-        continue;
-      }
-      out.push({
-        key: name,
-        entry: {
-          type: "remote",
-          url: server.url,
-          headers: collectHeaders(server.headers),
-          enabled: true,
-        },
-      });
-    } else if (server.type === "sse") {
-      if (hasUnknownKeys(server, HTTP_KEYS)) {
-        log(`skipping MCP server "${pkg.name}/${name}": unknown fields in sse entry`);
-        continue;
-      }
-      log(`skipping MCP server "${pkg.name}/${name}": opencode does not support the sse transport`);
-    } else {
-      log(`skipping MCP server "${pkg.name}/${name}": unknown transport "${String(server.type)}"`);
-    }
-  }
-}
-
 // --- Merge logic ------------------------------------------------------------
 
 // Computes the config contribution from the discovered packages: every unique
@@ -640,7 +493,11 @@ export function readMcp(
 // the user's existing config so user-defined entries are never overwritten.
 export function planConfig(
   packages: PluginPackage[],
-  taken: { commands?: Iterable<string>; mcp?: Iterable<string> } = {},
+  taken: {
+    commands?: Iterable<string>;
+    mcp?: Iterable<string>;
+    agents?: Iterable<string>;
+  } = {},
 ): ConfigPatch {
   const skillPaths: string[] = [];
   const seenDir = new Set<string>();
@@ -720,5 +577,83 @@ export function planConfig(
     }
   }
 
-  return { skillPaths, commands, mcp };
+  const agents: ConfigPatch["agents"] = [];
+  const usedAgents = new Set(taken.agents ?? []);
+  const agentOwner = new Map<string, PackageSource | "user">();
+  for (const name of taken.agents ?? []) agentOwner.set(name, "user");
+  const seenAgent = new Set<string>();
+  for (const pkg of packages) {
+    for (const { name, agent } of readAgents(pkg)) {
+      const dedupeKey = `${pkg.root}\u0000${name}`;
+      if (seenAgent.has(dedupeKey)) continue;
+      seenAgent.add(dedupeKey);
+      let agentName = name;
+      const owner = agentOwner.get(agentName);
+      if (owner !== undefined) {
+        if (owner === pkg.source) continue;
+        const namespaced = `${pkg.name}-${agentName}`;
+        if (usedAgents.has(namespaced)) {
+          log(`skipping agent "${pkg.name}/${agentName}": name already taken`);
+          continue;
+        }
+        agentName = namespaced;
+      }
+      agentOwner.set(agentName, pkg.source);
+      usedAgents.add(agentName);
+      agents.push({ name: agentName, agent });
+    }
+  }
+
+  return { skillPaths, commands, mcp, agents };
+}
+
+// Applies a computed plan to the resolved config. Never overwrites user-defined
+// entries; de-duplicates paths against what the user already configured.
+// `enabled` gates the opt-in component types (MCP servers, agents), which are
+// more powerful than skills and therefore off by default.
+export function applyConfigPatch(
+  config: ConfigLike,
+  plan: ConfigPatch,
+  enabled: { mcp: boolean; agents: boolean },
+): void {
+  const doAgents = enabled.agents && plan.agents.length > 0;
+  if (plan.skillPaths.length === 0 && !enabled.mcp && !doAgents) return;
+
+  if (plan.skillPaths.length > 0) {
+    config.skills ??= {};
+    config.skills.paths ??= [];
+    const seen = new Set(config.skills.paths);
+    for (const dir of plan.skillPaths) {
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      config.skills.paths.push(dir);
+    }
+  }
+
+  if (plan.commands.length > 0) {
+    config.command ??= {};
+    for (const cmd of plan.commands) {
+      if (config.command[cmd.name]) continue;
+      config.command[cmd.name] = {
+        description: cmd.description,
+        template: cmd.template,
+      };
+    }
+  }
+
+  if (enabled.mcp && plan.mcp.length > 0) {
+    config.mcp ??= {};
+    for (const { key, entry } of plan.mcp) {
+      if (config.mcp[key]) continue;
+      config.mcp[key] = entry;
+    }
+  }
+
+  if (doAgents) {
+    config.agent ??= {};
+    for (const { name, agent } of plan.agents) {
+      if (config.agent[name]) continue;
+      config.agent[name] = agent;
+    }
+  }
 }

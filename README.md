@@ -62,6 +62,29 @@ and both variables are injected into each stdio server's environment
 per-entry, never fatally. `sse` servers and stdio `cwd` (which opencode cannot
 represent) are dropped with a log line.
 
+### Agents (opt-in)
+
+Agent Plugins 1.0.0 has no portable "agents" component type (only skills and
+MCP servers), so agents are contributed through the spec's client-extension
+mechanism. With the `agents` option, the plugin reads agents from three
+sources, in order:
+
+1. `plugin.json` → `extensions["dev.opencode"].agents` (a map of agent name →
+   opencode `agent` config).
+2. A `dev.opencode/agents/<name>.json` extension directory (one opencode agent
+   config per file).
+3. A legacy Claude Code plugin shim: `.claude-plugin/plugin.json` `agents`,
+   mapping `description` and `systemPrompt` (or the `agents/<name>/AGENTS.md`
+   body) onto an opencode agent.
+
+Discovered agents are registered as `config.agent.<name>` with the same rules
+as commands: user-defined agents are never overwritten, same-source mirrors are
+collapsed, and cross-source collisions become `<package>-<agent>`.
+
+**Trust note:** a package-supplied `permission` block is always dropped — agent
+permissions are too powerful to inherit from a package by default. If you need
+one, define the agent yourself in `opencode.json` (which always wins).
+
 ### Slash commands
 
 opencode treats skills and slash commands as separate mechanisms: skills are
@@ -100,7 +123,8 @@ Use the tuple form to configure options:
         "extraRoots": ["/home/user/.vscode-server"],
         "scanCache": true,
         "scanNodeModules": true,
-        "mcp": false
+        "mcp": false,
+        "agents": false
       }
     ]
   ]
@@ -113,6 +137,7 @@ Use the tuple form to configure options:
 | `scanCache` | `true` | Scan opencode's plugin cache (`~/.cache/opencode/packages/*`) for Agent Plugins packages. |
 | `scanNodeModules` | `true` | Scan the project's `node_modules` (incl. `@scope/*`) for Agent Plugins packages. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
+| `agents` | `false` | Also register agents from packages (see "Agents" above). |
 
 ## Notes
 
