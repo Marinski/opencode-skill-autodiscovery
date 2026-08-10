@@ -145,6 +145,57 @@ Use the tuple form to configure options:
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
 
+## VPS / remote hosts (SSH sessions)
+
+Discovery is **machine-local**: a remote session only sees the skills, agents,
+and packages installed **on that host**. So opencode (and this plugin) must be
+installed on each remote machine, and you run opencode inside the SSH session —
+not from a local client terminal.
+
+**On each remote host:**
+
+```sh
+# 1. Install opencode if it isn't there yet
+npm install -g opencode-ai
+
+# 2. Install this plugin globally. The -g flag targets the machine-wide config;
+#    without it, opencode writes a project-scoped .opencode/opencode.json
+#    instead (easy to miss, because the plugin looks installed but only for
+#    that one directory).
+opencode plugin opencode-skill-autodiscovery -g
+
+# 3. Restart opencode. It fetches the latest published version into the
+#    remote's own cache.
+```
+
+Or hand-edit the remote's global config (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "plugin": [["opencode-skill-autodiscovery", { "mcp": true, "agents": true }]]
+}
+```
+
+**What a remote session discovers** (that host's own installs):
+- VS Code Remote-SSH synced skills from `~/.vscode-server/data/agentPlugins/`
+  (read via the `cache.json` LRU).
+- Claude Code remote plugins from `~/.claude/remote/plugins/`.
+- Agent Plugins packages in the remote's opencode cache
+  (`~/.cache/opencode/packages/*`) and the project's `node_modules`.
+
+**Caveats:**
+- Run opencode **on the remote**. A local client terminal reads the local
+  machine's manifests, not the remote's.
+- VS Code only syncs **enabled** skills to the server as a flattened "VS Code
+  Synced Data" bundle; marketplace clones (including their `agents/*.md`
+  files) are generally not copied. Install the pack on the remote too if you
+  want its agents there.
+- To force a re-fetch of a new release on a remote, clear the cached copy and
+  restart (opencode re-downloads the latest):
+  ```sh
+  rm -rf ~/.cache/opencode/packages/opencode-skill-autodiscovery*
+  ```
+
 ## Notes
 
 - Discovery is inherently **machine-local**: it reads manifests from the home
