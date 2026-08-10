@@ -66,7 +66,7 @@ represent) are dropped with a log line.
 
 Agent Plugins 1.0.0 has no portable "agents" component type (only skills and
 MCP servers), so agents are contributed through the spec's client-extension
-mechanism. With the `agents` option, the plugin reads agents from three
+mechanism. With the `agents` option, the plugin reads agents from four
 sources, in order:
 
 1. `plugin.json` → `extensions["dev.opencode"].agents` (a map of agent name →
@@ -76,6 +76,12 @@ sources, in order:
 3. A legacy Claude Code plugin shim: `.claude-plugin/plugin.json` `agents`,
    mapping `description` and `systemPrompt` (or the `agents/<name>/AGENTS.md`
    body) onto an opencode agent.
+4. Flat `agents/<name>.md` files (the agency-agents layout) — one agent per
+   file, keyed by filename, with `description`/`color` from frontmatter and the
+   markdown body as the prompt.
+
+Agents discovered without an explicit `mode` default to opencode's `all`, so
+they are both Tab-selectable and spawnable as subagents.
 
 Discovered agents are registered as `config.agent.<name>` with the same rules
 as commands: user-defined agents are never overwritten, same-source mirrors are

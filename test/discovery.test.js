@@ -729,6 +729,69 @@ test("readAgents: reads Claude Code plugin agents shim with AGENTS.md fallback",
   }
 });
 
+test("readAgents: reads flat agents/<name>.md files (agency-agents layout)", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+    writeFileSync(join(pkgDir, "skills", "s", "SKILL.md"), "---\nname: s\n---\n");
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "agents", "engineering-code-reviewer.md"),
+      [
+        "---",
+        "name: Code Reviewer",
+        "description: Expert code reviewer",
+        "color: purple",
+        "---",
+        "",
+        "You are Code Reviewer.",
+      ].join("\n"),
+    );
+    writeFileSync(join(pkgDir, "agents", "empty.md"), "");
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "engineering-code-reviewer");
+    assert.equal(agents[0].agent.description, "Expert code reviewer");
+    assert.equal(agents[0].agent.color, "purple");
+    assert.equal(agents[0].agent.prompt, "You are Code Reviewer.");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: dev.opencode agents win over flat agents with the same name", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: { reviewer: { description: "Manifest agent" } },
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      join(pkgDir, "agents", "reviewer.md"),
+      "---\ndescription: Flat agent\n---\nFlat body",
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].agent.description, "Manifest agent");
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("planConfig: namespaces agent collisions across distinct sources", () => {
   const root = makeTemp();
   try {

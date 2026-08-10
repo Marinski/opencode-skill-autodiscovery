@@ -151,5 +151,53 @@ export function readAgents(
     }
   }
 
+  // Legacy flat agent files: agents/<name>.md. Used by packs (e.g.
+  // agency-agents) that ship one markdown file per specialist without
+  // declaring an `agents` field in their .claude-plugin manifest.
+  const flatAgentsDir = join(pkg.root, "agents");
+  let flatEntries: string[];
+  try {
+    flatEntries = readdirSync(flatAgentsDir);
+  } catch {
+    flatEntries = [];
+  }
+  for (const entry of flatEntries) {
+    if (!entry.endsWith(".md")) continue;
+    const name = entry.slice(0, -".md".length);
+    if (out.has(name)) continue;
+    let content: string;
+    try {
+      content = readFileSync(join(flatAgentsDir, entry), "utf8");
+    } catch {
+      continue;
+    }
+    const { description, color, body } = parseAgentMarkdown(content);
+    if (!description && !body) continue;
+    const agent: AgentConfig = {};
+    if (description) agent.description = description;
+    if (color) agent.color = color;
+    if (body) agent.prompt = body;
+    out.set(name, agent);
+  }
+
   return [...out.entries()].map(([name, agent]) => ({ name, agent }));
+}
+
+// Extracts frontmatter fields (description, color) and the markdown body from
+// a flat agent file. The body becomes the agent's system prompt.
+function parseAgentMarkdown(content: string): {
+  description?: string;
+  color?: string;
+  body: string;
+} {
+  const m = /^---\s*\n([\s\S]*?)\n---/.exec(content);
+  if (!m) return { body: content };
+  const field = (key: string): string | undefined => {
+    const fm = new RegExp(`^${key}:[ \\t]*(.*)$`, "m").exec(m[1]);
+    return fm ? fm[1].trim().replace(/^["']|["']$/g, "") : undefined;
+  };
+  const description = field("description");
+  const color = field("color");
+  const body = content.slice(m[0].length).trim();
+  return { description: description || undefined, color: color || undefined, body };
 }
