@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyConfigPatch,
+  collectClaude,
   collectClaudeManifest,
   collectNodeModules,
   collectOpencodeCache,
@@ -520,6 +521,43 @@ test("collectClaudeManifest: resolves installPaths from installed_plugins.json",
     assert.equal(out.length, 1);
     assert.equal(out[0].name, "alpha");
     assert.equal(out[0].skillDirs.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectClaude: walks hash-named remote plugin dirs for flat agents and skills", () => {
+  const root = makeTemp();
+  try {
+    // Simulate ~/.claude/remote/plugins/<hash>/ holding a plugin with flat
+    // agent files and a skills tree, no installed_plugins.json at all.
+    const remote = join(root, ".claude", "remote", "plugins");
+    const hashDir = join(remote, "6d93ea7b9a6121ca");
+    mkdirSync(join(hashDir, "skills", "s"), { recursive: true });
+    writeFileSync(join(hashDir, "skills", "s", "SKILL.md"), "---\nname: s\n---\n");
+    writeFileSync(
+      join(hashDir, "engineering-code-reviewer.md"),
+      "---\ndescription: Reviews diffs\n---\nYou review code.",
+    );
+    const oldHome = process.env.HOME;
+    const oldUser = process.env.USERPROFILE;
+    process.env.HOME = root;
+    process.env.USERPROFILE = root;
+    try {
+      const out = [];
+      collectClaude(out);
+      const pkg = out.find((p) => p.source === "claude");
+      assert.ok(pkg, "hash-named remote plugin discovered");
+      assert.equal(pkg.skillDirs.length, 1);
+      const agents = readAgents(pkg);
+      assert.equal(agents.length, 1);
+      assert.equal(agents[0].name, "engineering-code-reviewer");
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      if (oldUser === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = oldUser;
+    }
   } finally {
     cleanup(root);
   }

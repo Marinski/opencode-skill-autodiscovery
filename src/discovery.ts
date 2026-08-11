@@ -497,10 +497,19 @@ export function collectClaude(out: PluginPackage[]): void {
   // Always scan the SSH-synced remote bundle too: it can exist alongside a
   // local Claude Code install that has its own installed_plugins.json, and
   // the same-source mirror dedup in planConfig collapses any overlap.
+  //
+  // Like the VS Code agent plugin dir, the remote plugins root holds
+  // hash-named plugin directories with no manifest. Walk it with
+  // findPluginRoots so skills and flat agent markdown files are found by
+  // filename wherever they live — no hardcoded folder names needed.
   const remoteRoot = join(home, ".claude", "remote", "plugins");
   if (existsSync(remoteRoot)) {
-    const pkg = packageFromDir(remoteRoot, "claude");
-    if (pkg) out.push(pkg);
+    const roots: string[] = [];
+    findPluginRoots(remoteRoot, roots);
+    for (const pluginRoot of roots) {
+      const pkg = packageFromDir(pluginRoot, "claude");
+      if (pkg) out.push(pkg);
+    }
   }
 }
 
