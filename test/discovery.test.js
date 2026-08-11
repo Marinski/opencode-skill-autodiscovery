@@ -14,6 +14,7 @@ import {
   collectClaudeManifest,
   collectNodeModules,
   collectOpencodeCache,
+  collectVscode,
   collectVscodeCache,
   collectVscodeManifest,
   contains,
@@ -576,6 +577,82 @@ test("sanitize: strips ANSI escapes and control characters", () => {
   assert.equal(sanitize("a\u0007b\u001fc"), "abc");
 });
 
+test("collectAgentPluginRoot: a marketplace clone is discovered even when only cache.json exists", () => {
+  const root = makeTemp();
+  try {
+    // Remote layout: agentPlugins/ holds a synced-bundle cache.json AND a
+    // marketplace clone that has no installed.json entry. The clone must
+    // still be found via the plugin-root tree walk.
+    const agentPlugins = join(root, "data", "agentPlugins");
+    const eng = join(
+      agentPlugins,
+      "github.com",
+      "Marinski",
+      "agency-agents",
+      "ref_plugins",
+      "plugins",
+      "engineering",
+    );
+    mkdirSync(join(eng, "skills", "code-review"), { recursive: true });
+    writeFileSync(
+      join(eng, "skills", "code-review", "SKILL.md"),
+      "---\nname: code-review\n---\n",
+    );
+    mkdirSync(join(eng, "agents"), { recursive: true });
+    writeFileSync(
+      join(eng, "agents", "engineering-code-reviewer.md"),
+      "---\ndescription: Reviews diffs\n---\nYou review code.",
+    );
+    writeFileSync(join(agentPlugins, "cache.json"), JSON.stringify([]));
+    const out = [];
+    collectVscode(out, [root]);
+    const normRoot = root.replace(/\\/g, "/");
+    const engPkg = out.find(
+      (p) =>
+        p.source === "vscode" &&
+        p.name === "engineering" &&
+        p.root.replace(/\\/g, "/").startsWith(normRoot),
+    );
+    assert.ok(engPkg, "marketplace clone discovered despite cache.json");
+    assert.equal(engPkg.skillDirs.length, 1);
+    const agents = readAgents(engPkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "engineering-code-reviewer");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectAgentPluginRoot: installed.json suppresses the fallback walk", () => {
+  const root = makeTemp();
+  try {
+    // Local layout: installed.json is authoritative. A clone that is NOT
+    // listed there must stay hidden (cloned-but-not-installed marketplace).
+    const agentPlugins = join(root, "agentPlugins");
+    const listed = join(agentPlugins, "github.com", "org", "installed-plugin");
+    const stray = join(agentPlugins, "github.com", "org", "stray-plugin");
+    makePackage(listed, "listed", ["s"]);
+    makePackage(stray, "stray", ["s"]);
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        version: 1,
+        installed: [{ pluginUri: `file:///${listed.replace(/\\/g, "/")}`, name: "listed" }],
+      }),
+    );
+    const out = [];
+    collectVscode(out, [root]);
+    const normRoot = root.replace(/\\/g, "/");
+    const names = out
+      .filter((p) => p.root.replace(/\\/g, "/").startsWith(normRoot))
+      .map((p) => p.name);
+    assert.ok(names.includes("listed"), "installed plugin discovered");
+    assert.ok(!names.includes("stray"), "unlisted clone stays hidden");
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("applyConfigPatch: merges without overwriting user entries", () => {
   const plan = {
     skillPaths: ["/a/s1", "/a/s2"],
@@ -755,8 +832,69 @@ test("readAgents: reads flat agents/<name>.md files (agency-agents layout)", () 
     assert.equal(agents.length, 1);
     assert.equal(agents[0].name, "engineering-code-reviewer");
     assert.equal(agents[0].agent.description, "Expert code reviewer");
-    assert.equal(agents[0].agent.color, "purple");
+    assert.equal(agents[0].agent.color, "#800080");
     assert.equal(agents[0].agent.prompt, "You are Code Reviewer.");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: normalizes agent colors to values opencode accepts", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    const cases = {
+      // Claude Code frontmatter uses bare CSS names: must be mapped to hex.
+      named: "orange",
+      // opencode theme tokens and hex literals pass through untouched.
+      token: "Warning",
+      hex: "#a1B2c3",
+      shorthand: "#0f8",
+      // Anything else would reject the entire merged config: drop it.
+      bogus: "chartreuse-ish",
+    };
+    for (const [name, color] of Object.entries(cases)) {
+      writeFileSync(
+        join(pkgDir, "agents", `${name}.md`),
+        `---\ndescription: ${name}\ncolor: ${color}\n---\nBody`,
+      );
+    }
+    const pkg = readPackage(pkgDir, "node_modules");
+    const byName = new Map(readAgents(pkg).map((a) => [a.name, a.agent]));
+    assert.equal(byName.get("named").color, "#FFA500");
+    assert.equal(byName.get("token").color, "warning");
+    assert.equal(byName.get("hex").color, "#a1B2c3");
+    assert.equal(byName.get("shorthand").color, "#00ff88");
+    assert.equal(byName.get("bogus").color, undefined);
+    // A dropped color must not cost us the agent itself.
+    assert.equal(byName.get("bogus").description, "bogus");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: normalizes colors from dev.opencode manifest agents too", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: { reviewer: { description: "Reviews diffs", color: "orange" } },
+          },
+        },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents[0].agent.color, "#FFA500");
   } finally {
     cleanup(root);
   }

@@ -24,6 +24,77 @@ const OPENCODE_NS = "dev.opencode";
 
 const MODES = new Set(["subagent", "primary", "all"]);
 
+// opencode accepts a `#RRGGBB` literal or one of its theme tokens; anything else
+// makes the whole config fail to load. Claude Code agent frontmatter, however,
+// uses bare CSS colour names, so translate the ones it emits and drop the rest.
+const COLOR_TOKENS = new Set([
+  "primary",
+  "secondary",
+  "accent",
+  "success",
+  "warning",
+  "error",
+  "info",
+]);
+
+// CSS named colours where one exists, Tailwind's 500 shade for the names CSS
+// does not define (amber, slate, rose). Covers every bare name observed across
+// shipped Claude Code / Agent Plugins agent frontmatter.
+const COLOR_NAMES: Record<string, string> = {
+  red: "#FF0000",
+  orange: "#FFA500",
+  amber: "#F59E0B",
+  gold: "#FFD700",
+  yellow: "#FFFF00",
+  olive: "#808000",
+  lime: "#00FF00",
+  green: "#008000",
+  teal: "#008080",
+  turquoise: "#40E0D0",
+  aqua: "#00FFFF",
+  cyan: "#00FFFF",
+  "neon-cyan": "#00FFFF",
+  "neon-green": "#39FF14",
+  blue: "#0000FF",
+  navy: "#000080",
+  "metallic-blue": "#4682B4",
+  indigo: "#4B0082",
+  violet: "#EE82EE",
+  purple: "#800080",
+  magenta: "#FF00FF",
+  fuchsia: "#FF00FF",
+  pink: "#FFC0CB",
+  rose: "#F43F5E",
+  crimson: "#DC143C",
+  maroon: "#800000",
+  brown: "#A52A2A",
+  slate: "#64748B",
+  silver: "#C0C0C0",
+  white: "#FFFFFF",
+  gray: "#808080",
+  grey: "#808080",
+  black: "#000000",
+};
+
+// Returns a value opencode's config schema will accept, or undefined when the
+// colour is unusable. Never let an unrecognised value through: a single bad
+// colour rejects the entire merged config.
+function normalizeColor(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const value = raw.trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(value)) return value;
+  // `#RGB` shorthand is valid CSS but not accepted by opencode; expand it.
+  if (/^#[0-9a-fA-F]{3}$/.test(value)) {
+    return `#${value.slice(1).split("").map((c) => c + c).join("")}`;
+  }
+  const lower = value.toLowerCase();
+  if (COLOR_TOKENS.has(lower)) return lower;
+  const mapped = COLOR_NAMES[lower];
+  if (mapped) return mapped;
+  log(`dropping unsupported agent color ${JSON.stringify(value)}`);
+  return undefined;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null
     ? (value as Record<string, unknown>)
@@ -56,7 +127,7 @@ function toAgentConfig(raw: unknown): AgentConfig | null {
   const model = stringValue("model");
   const prompt = stringValue("prompt");
   const description = stringValue("description");
-  const color = stringValue("color");
+  const color = normalizeColor(stringValue("color"));
   const temperature = numberValue("temperature");
   const topP = numberValue("top_p");
   const maxSteps = numberValue("maxSteps");
@@ -197,7 +268,7 @@ function parseAgentMarkdown(content: string): {
     return fm ? fm[1].trim().replace(/^["']|["']$/g, "") : undefined;
   };
   const description = field("description");
-  const color = field("color");
+  const color = normalizeColor(field("color"));
   const body = content.slice(m[0].length).trim();
-  return { description: description || undefined, color: color || undefined, body };
+  return { description: description || undefined, color, body };
 }
