@@ -222,33 +222,40 @@ export function readAgents(
     }
   }
 
-  // Legacy flat agent files: agents/<name>.md. Used by packs (e.g.
-  // agency-agents) that ship one markdown file per specialist without
-  // declaring an `agents` field in their .claude-plugin manifest.
-  const flatAgentsDir = join(pkg.root, "agents");
-  let flatEntries: string[];
-  try {
-    flatEntries = readdirSync(flatAgentsDir);
-  } catch {
-    flatEntries = [];
-  }
-  for (const entry of flatEntries) {
-    if (!entry.endsWith(".md")) continue;
-    const name = entry.slice(0, -".md".length);
-    if (out.has(name)) continue;
-    let content: string;
+  // Legacy flat agent files: agents/<name>.md, plus bare <name>.md files in
+  // the package root (the current agency-agents layout: engineering/*.md).
+  // Both ship one markdown file per specialist without declaring an `agents`
+  // field in a .claude-plugin manifest.
+  const flatRoots = [join(pkg.root, "agents"), pkg.root];
+  for (const flatAgentsDir of flatRoots) {
+    const isRoot = flatAgentsDir === pkg.root;
+    let flatEntries: string[];
     try {
-      content = readFileSync(join(flatAgentsDir, entry), "utf8");
+      flatEntries = readdirSync(flatAgentsDir);
     } catch {
       continue;
     }
-    const { description, color, body } = parseAgentMarkdown(content);
-    if (!description && !body) continue;
-    const agent: AgentConfig = {};
-    if (description) agent.description = description;
-    if (color) agent.color = color;
-    if (body) agent.prompt = body;
-    out.set(name, agent);
+    for (const entry of flatEntries) {
+      if (!entry.endsWith(".md")) continue;
+      const name = entry.slice(0, -".md".length);
+      if (out.has(name)) continue;
+      let content: string;
+      try {
+        content = readFileSync(join(flatAgentsDir, entry), "utf8");
+      } catch {
+        continue;
+      }
+      // Bare .md files in the package root may be docs (README.md); only treat
+      // them as agents when they carry a frontmatter block.
+      if (isRoot && !/^---\s*\n/.test(content)) continue;
+      const { description, color, body } = parseAgentMarkdown(content);
+      if (!description && !body) continue;
+      const agent: AgentConfig = {};
+      if (description) agent.description = description;
+      if (color) agent.color = color;
+      if (body) agent.prompt = body;
+      out.set(name, agent);
+    }
   }
 
   return [...out.entries()].map(([name, agent]) => ({ name, agent }));

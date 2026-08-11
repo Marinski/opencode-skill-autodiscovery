@@ -33,7 +33,7 @@ Agent Plugins 1.0.0 has no portable "agents" component type (only skills and MCP
 1. `plugin.json` → `extensions["dev.opencode"].agents` (a map of agent name → opencode `agent` config).
 2. A `dev.opencode/agents/<name>.json` extension directory (one opencode agent config per file).
 3. A legacy Claude Code plugin shim: `.claude-plugin/plugin.json` `agents`, mapping `description` and `systemPrompt` (or the `agents/<name>/AGENTS.md` body) onto an opencode agent.
-4. Flat `agents/<name>.md` files (the agency-agents layout) — one agent per file, keyed by filename, with `description`/`color` from frontmatter and the markdown body as the prompt.
+4. Flat agent markdown files — the agency-agents layout: one agent per file, keyed by filename, with `description`/`color` from frontmatter and the markdown body as the prompt. Both `agents/<name>.md` (older layout) and bare `<name>.md` in the package root (current `engineering/*.md` layout) are read; doc files like `README.md` are ignored.
 
 Agents discovered without an explicit `mode` default to opencode's `all`, so they are both Tab-selectable and spawnable as subagents.
 
@@ -136,7 +136,7 @@ Or hand-edit the remote's global config (`~/.config/opencode/opencode.json`):
 
 - Discovery is inherently **machine-local**: it reads manifests from the home directory of the machine opencode is running on. Remote sessions on a different machine will discover that machine's skills.
 - On a remote host, VS Code does **not** copy your marketplace plugins over. It syncs only the enabled skills/agents/etc. from your client as a single flattened "VS Code Synced Data" bundle under `~/.vscode-server/data/agentPlugins/`. That is why you won't see the original `{org}/{repo}` layout on the remote — the skill directories are named after the skills instead. This plugin reads `cache.json` to locate those materialized bundles.
-- Newer VS Code layouts have no `installed.json` at all; marketplaces are cloned directly under the agent plugin dir. When `installed.json` is absent the plugin falls back to a tree walk over the plugin roots, so a marketplace clone (e.g. a remote where VS Code only wrote `cache.json`) is still discovered — including its `agents/*.md`. When `installed.json` does exist, it is authoritative and cloned-but-not-installed marketplaces stay hidden.
+- Newer VS Code layouts have no `installed.json` at all; marketplaces are cloned directly under the agent plugin dir. When `installed.json` is absent the plugin falls back to a tree walk over the plugin roots, so a marketplace clone (e.g. a remote where VS Code only wrote `cache.json`) is still discovered — including its `agents/*.md` and bare `<name>.md` agent files. When `installed.json` does exist, it is authoritative and cloned-but-not-installed marketplaces stay hidden.
 - VS Code account sync only syncs your marketplace extension list; each machine still has its own `installed.json`/`cache.json` that this plugin reads.
 - A package is only treated as an Agent Plugins package when its root `plugin.json` declares a `$schema` under `https://agent-plugins.org/schemas/`. Everything else is ignored by the cache/node_modules scanners and falls back to the tree walk elsewhere.
 - The same plugin can be materialised in several VS Code layouts at once (local clone + synced bundle + marketplace clone). `skills.paths` keeps all paths; slash commands and MCP servers are de-duplicated so mirrors don't create a wall of `/mirror-of-...` junk.

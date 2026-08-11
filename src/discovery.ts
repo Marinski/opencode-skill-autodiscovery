@@ -190,7 +190,8 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
 }
 
 // True when `root` directly carries a plugin-like layout: a `skills/` subtree,
-// a flat `agents/` directory of markdown files, or a `.claude-plugin/plugin.json`.
+// a flat `agents/` directory of markdown files, a `.claude-plugin/plugin.json`,
+// or bare agent markdown files in the root itself.
 function hasPluginLayout(root: string): boolean {
   const skillsRoot = join(root, "skills");
   if (isDirectory(skillsRoot)) {
@@ -202,14 +203,29 @@ function hasPluginLayout(root: string): boolean {
       // fall through
     }
   }
-  try {
-    if (readdirSync(join(root, "agents")).some((e) => e.endsWith(".md"))) {
-      return true;
-    }
-  } catch {
-    // fall through
-  }
+  if (hasRootAgentFiles(root)) return true;
   return isRegularFile(join(root, ".claude-plugin", "plugin.json"));
+}
+
+// True when `root` holds flat agent markdown files directly (the current
+// agency-agents layout: engineering/*.md). A file counts as an agent when it
+// has a frontmatter block carrying at least a `name` or `description`, which
+// keeps README/docs out of the agent list.
+function hasRootAgentFiles(root: string): boolean {
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return false;
+  }
+  return entries.some((e) => {
+    if (!e.endsWith(".md")) return false;
+    const full = join(root, e);
+    if (!isRegularFile(full)) return false;
+    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(full, "utf8"))?.[1];
+    if (!m) return false;
+    return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
+  });
 }
 
 // Returns directories under `root` that are individual plugin roots. This
@@ -255,9 +271,11 @@ function hasClaudeAgents(root: string): boolean {
   }
 }
 
-// True when a plugin carries flat agents/<name>.md files (agency-agents
-// layout), which readAgents picks up even without a manifest `agents` field.
+// True when a plugin carries flat agent files: agents/<name>.md or bare
+// <name>.md in the root (agency-agents layouts), which readAgents picks up
+// even without a manifest `agents` field.
 function hasFlatAgents(root: string): boolean {
+  if (hasRootAgentFiles(root)) return true;
   try {
     return readdirSync(join(root, "agents")).some((e) => e.endsWith(".md"));
   } catch {

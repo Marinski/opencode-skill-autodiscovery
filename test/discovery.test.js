@@ -598,9 +598,8 @@ test("collectAgentPluginRoot: a marketplace clone is discovered even when only c
       join(eng, "skills", "code-review", "SKILL.md"),
       "---\nname: code-review\n---\n",
     );
-    mkdirSync(join(eng, "agents"), { recursive: true });
     writeFileSync(
-      join(eng, "agents", "engineering-code-reviewer.md"),
+      join(eng, "engineering-code-reviewer.md"),
       "---\ndescription: Reviews diffs\n---\nYou review code.",
     );
     writeFileSync(join(agentPlugins, "cache.json"), JSON.stringify([]));
@@ -834,6 +833,44 @@ test("readAgents: reads flat agents/<name>.md files (agency-agents layout)", () 
     assert.equal(agents[0].agent.description, "Expert code reviewer");
     assert.equal(agents[0].agent.color, "#800080");
     assert.equal(agents[0].agent.prompt, "You are Code Reviewer.");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: reads bare <name>.md files in the package root (new agency-agents layout)", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "engineering");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "engineering-code-reviewer.md"),
+      [
+        "---",
+        "name: Code Reviewer",
+        "description: Expert code reviewer",
+        "color: purple",
+        "---",
+        "",
+        "You are Code Reviewer.",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(pkgDir, "engineering-ai-engineer.md"),
+      "---\ndescription: AI engineer\n---\nYou build AI.",
+    );
+    // Docs and non-agent files in the root must be ignored.
+    writeFileSync(join(pkgDir, "README.md"), "# Not an agent");
+    writeFileSync(join(pkgDir, "divisions.json"), JSON.stringify({}));
+    const pkg = packageFromDir(pkgDir, "vscode");
+    assert.ok(pkg, "root-level agent files make the dir a package");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 2);
+    const byName = new Map(agents.map((a) => [a.name, a.agent]));
+    assert.equal(byName.get("engineering-code-reviewer").prompt, "You are Code Reviewer.");
+    assert.equal(byName.get("engineering-code-reviewer").color, "#800080");
+    assert.equal(byName.get("engineering-ai-engineer").description, "AI engineer");
+    assert.equal(byName.get("README"), undefined, "README.md is not an agent");
   } finally {
     cleanup(root);
   }
