@@ -1,6 +1,6 @@
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "../dist/index.js";
@@ -239,4 +239,74 @@ test("config hook: opencode plugin cache is not scanned unless scanCache is true
     true,
     "slash command restored with scanCache:true",
   );
+});
+
+test("config hook: no plugin-data directory without flags or with an unparseable mcp.json", async () => {
+  // FS snapshot: readMcp's stdio branch is the only code path that creates
+  // {state}/opencode/plugin-data/{pkg}, and it must do so only when the mcp
+  // flag is enabled AND mcp.json parsed successfully.
+  const pluginDataRoot = join(envRoot, ".local", "state", "opencode", "plugin-data");
+
+  // Package carrying every component type (skill, agent, valid stdio
+  // mcp.json) with both opt-in flags off: nothing may touch plugin-data.
+  const pkgDir = join(envRoot, "node_modules", "fssnap");
+  mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "s", "SKILL.md"),
+    "---\nname: s\ndescription: s\n---\n# s\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "fssnap",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            reviewer: { description: "Reviews diffs", prompt: "You review code" },
+          },
+        },
+      },
+    }),
+  );
+  writeFileSync(
+    join(pkgDir, "mcp.json"),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: { srv: { type: "stdio", command: "npx", args: ["-y", "server"] } },
+    }),
+  );
+
+  // mcp:false / agents:false (the defaults): package is discovered...
+  const off = await runHook({ scanNodeModules: true });
+  assert.ok(
+    off.skills.paths.some((p) => p.includes("fssnap")),
+    "fixture must actually be discovered for the snapshot to be meaningful",
+  );
+  assert.equal(off.mcp, undefined);
+  assert.equal(off.agent, undefined);
+  // ...but no {state}/opencode/plugin-data/** path may exist. The root is
+  // created recursively by mkdirSync, so its absence implies every child's.
+  assert.equal(existsSync(pluginDataRoot), false, "no plugin-data root with flags off");
+  assert.equal(
+    existsSync(join(pluginDataRoot, "fssnap")),
+    false,
+    "no per-package plugin-data dir with flags off",
+  );
+
+  // Flag enabled but the manifest is unparseable: readMcp bails before any
+  // side effect, so still no plugin-data directory.
+  rmSync(join(envRoot, "node_modules", "fssnap"), { recursive: true, force: true });
+  const badDir = join(envRoot, "node_modules", "fssnap-bad");
+  mkdirSync(badDir, { recursive: true });
+  writeFileSync(
+    join(badDir, "plugin.json"),
+    JSON.stringify({ $schema: SCHEMA, name: "fssnap-bad" }),
+  );
+  writeFileSync(
+    join(badDir, "mcp.json"),
+    '{"$schema": "' + MCP_SCHEMA_URL + '", "mcpServers": {', // truncated JSON
+  );
+  await runHook({ scanNodeModules: true, mcp: true });
+  assert.equal(existsSync(pluginDataRoot), false, "no plugin-data root for unparseable mcp.json");
 });
