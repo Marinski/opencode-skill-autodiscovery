@@ -181,6 +181,8 @@ export function readPackage(
 // Visited and emitted paths are keyed on their real (symlink-resolved) forms,
 // so symlink cycles — self-referential or ancestor-pointing — terminate the
 // branch instead of growing ever-longer lexical paths until stack exhaustion.
+// Candidates whose real location resolves outside the starting root are
+// skipped, mirroring the containment guarantee of readPackage.
 export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
   let resolved: string;
   try {
@@ -188,17 +190,26 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
   } catch {
     return;
   }
-  if (seen.has(resolved)) return;
-  seen.add(resolved);
+  findSkillDirsUnder(resolved, resolved, out, seen);
+}
+
+function findSkillDirsUnder(
+  realRoot: string,
+  dir: string,
+  out: Set<string>,
+  seen: Set<string>,
+) {
+  if (seen.has(dir)) return;
+  seen.add(dir);
   let entries: string[];
   try {
-    entries = readdirSync(resolved);
+    entries = readdirSync(dir);
   } catch {
     return;
   }
   for (const entry of entries) {
     if (entry === ".git") continue;
-    const full = join(resolved, entry);
+    const full = join(dir, entry);
     if (!isDirectory(full)) continue;
     let child: string;
     try {
@@ -206,10 +217,14 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
     } catch {
       continue;
     }
+    if (!contains(realRoot, child)) {
+      log(`skipping skill dir "${child}": resolves outside "${realRoot}"`);
+      continue;
+    }
     if (isRegularFile(join(child, "SKILL.md"))) {
       out.add(child);
     } else {
-      findSkillDirs(child, out, seen);
+      findSkillDirsUnder(realRoot, child, out, seen);
     }
   }
 }

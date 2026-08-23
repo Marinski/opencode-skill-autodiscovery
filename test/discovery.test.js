@@ -297,6 +297,37 @@ test("findSkillDirs: terminates when a descendant links back to an ancestor", (t
   }
 });
 
+test("findSkillDirs: symlinked dir outside the walk root is never emitted", (t) => {
+  const root = makeTemp();
+  try {
+    const legacy = join(root, "legacy");
+    mkdirSync(join(legacy, "deep", "inner"), { recursive: true });
+    writeFileSync(
+      join(legacy, "deep", "inner", "SKILL.md"),
+      "---\nname: inner\n---\n",
+    );
+    const outside = join(root, "outside");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "SKILL.md"), "---\nname: evil\n---\n");
+    const type = process.platform === "win32" ? "junction" : "dir";
+    try {
+      symlinkSync(outside, join(legacy, "deep", "escape"), type);
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    const out = new Set();
+    findSkillDirs(legacy, out, new Set());
+    // `deep/escape` resolves outside `legacy`: neither it nor its SKILL.md
+    // may appear in the emitted dirs, even though the link itself sits
+    // inside the walked tree.
+    const expected = new Set([realpathSync(join(legacy, "deep", "inner"))]);
+    assert.deepEqual(out, expected);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectNodeModules: finds unscoped and scoped packages only", () => {
   const root = makeTemp();
   try {
