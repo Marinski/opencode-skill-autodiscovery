@@ -29,15 +29,18 @@ export default (async (_input, options) => {
       const scanNodeModules = options?.scanNodeModules === true;
       const mcpEnabled = options?.mcp === true;
       const agentsEnabled = options?.agents === true;
+      const exclude = Array.isArray(options?.exclude)
+        ? (options.exclude as string[])
+        : [];
 
       const packages: PluginPackage[] = [];
-      collectClaude(packages);
-      collectVscode(packages, extra);
+      collectClaude(packages, exclude);
+      collectVscode(packages, extra, exclude);
       if (scanCache) {
-        collectOpencodeCache(join(opencodeCacheRoot(), "packages"), packages);
+        collectOpencodeCache(join(opencodeCacheRoot(), "packages"), packages, exclude);
       }
       if (scanNodeModules) {
-        collectNodeModules(join(process.cwd(), "node_modules"), packages, false);
+        collectNodeModules(join(process.cwd(), "node_modules"), packages, false, exclude);
       }
 
       const plan = planConfig(packages, {

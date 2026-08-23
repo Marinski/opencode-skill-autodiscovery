@@ -177,6 +177,13 @@ export function readPackage(
   };
 }
 
+// True when a discovered package matches the user's exclude list. Conformant
+// packages match on their plugin.json manifest name; legacy packages fall back
+// to the directory basename (which is what their name already is).
+function isExcluded(pkg: PluginPackage, exclude: string[]): boolean {
+  return exclude.includes(pkg.name);
+}
+
 // Legacy tree walk: every directory containing a SKILL.md, at any depth.
 // Visited and emitted paths are keyed on their real (symlink-resolved) forms,
 // so symlink cycles — self-referential or ancestor-pointing — terminate the
@@ -329,6 +336,7 @@ function vscodePluginPath(pluginUri: string): string | null {
 export function collectVscodeManifest(
   out: PluginPackage[],
   installedJson: string,
+  exclude: string[] = [],
 ): void {
   if (!existsSync(installedJson)) return;
   let manifest: { installed?: Array<{ pluginUri?: string }> };
@@ -342,7 +350,7 @@ export function collectVscodeManifest(
     const dir = vscodePluginPath(plugin.pluginUri);
     if (dir) {
       const pkg = packageFromDir(dir, "vscode", true);
-      if (pkg) out.push(pkg);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }
@@ -354,7 +362,11 @@ type CacheEntry = { uri?: string; nonce?: string };
 // cache.json. Resolve each entry so the materialized synced-customization
 // bundle ("VS Code Synced Data" Open Plugin, skills/<name>/SKILL.md) is
 // discovered.
-export function collectVscodeCache(out: PluginPackage[], cacheJson: string): void {
+export function collectVscodeCache(
+  out: PluginPackage[],
+  cacheJson: string,
+  exclude: string[] = [],
+): void {
   if (!existsSync(cacheJson)) return;
   let entries: CacheEntry[];
   try {
@@ -374,13 +386,13 @@ export function collectVscodeCache(out: PluginPackage[], cacheJson: string): voi
     const nonceDir = join(parent, key, nonce);
     if (isDirectory(nonceDir)) {
       const pkg = packageFromDir(nonceDir, "vscode", true);
-      if (pkg) out.push(pkg);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     } else {
       // Layouts without the {nonce} subdirectory materialize the bundle
       // directly under {key}; walking it only when the nonce dir is absent
       // avoids re-descending into it.
       const pkg = packageFromDir(join(parent, key), "vscode", true);
-      if (pkg) out.push(pkg);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }
@@ -395,12 +407,16 @@ function sanitizeKey(value: string): string {
     .substring(0, 128);
 }
 
-function collectAgentPluginRoot(out: PluginPackage[], root: string): void {
+function collectAgentPluginRoot(
+  out: PluginPackage[],
+  root: string,
+  exclude: string[] = [],
+): void {
   const installedJson = join(root, "installed.json");
   const cacheJson = join(root, "cache.json");
   const hasManifest = existsSync(installedJson) || existsSync(cacheJson);
-  collectVscodeManifest(out, installedJson);
-  collectVscodeCache(out, cacheJson);
+  collectVscodeManifest(out, installedJson, exclude);
+  collectVscodeCache(out, cacheJson, exclude);
   // Newer VS Code installs marketplaces directly as {host}/{org}/{repo}
   // subdirectories with no manifest file at all. Fall back to a full tree walk
   // only when no metadata exists, so we don't surface skills from cloned-but-
@@ -409,13 +425,17 @@ function collectAgentPluginRoot(out: PluginPackage[], root: string): void {
     // No host-tool manifest vouches for this content (it covers user-supplied
     // extra roots too), so it stays in the untrusted tier.
     const pkg = packageFromDir(root, "vscode", false);
-    if (pkg) out.push(pkg);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
-export function collectVscode(out: PluginPackage[], extra: string[]): void {
+export function collectVscode(
+  out: PluginPackage[],
+  extra: string[],
+  exclude: string[] = [],
+): void {
   for (const dir of agentPluginDirs(vsCodeDataRoots(extra))) {
-    collectAgentPluginRoot(out, dir);
+    collectAgentPluginRoot(out, dir, exclude);
   }
 }
 
@@ -424,6 +444,7 @@ export function collectVscode(out: PluginPackage[], extra: string[]): void {
 export function collectClaudeManifest(
   out: PluginPackage[],
   installedJson: string,
+  exclude: string[] = [],
 ): void {
   if (!existsSync(installedJson)) return;
   let manifest: { plugins?: Record<string, Array<{ installPath?: string }>> };
@@ -436,13 +457,16 @@ export function collectClaudeManifest(
     for (const plugin of versions) {
       if (plugin.installPath) {
         const pkg = packageFromDir(plugin.installPath, "claude", true);
-        if (pkg) out.push(pkg);
+        if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
       }
     }
   }
 }
 
-export function collectClaude(out: PluginPackage[]): void {
+export function collectClaude(
+  out: PluginPackage[],
+  exclude: string[] = [],
+): void {
   const home = homedir();
   const installedJsons = [
     join(home, ".claude", "plugins", "installed_plugins.json"),
@@ -450,7 +474,7 @@ export function collectClaude(out: PluginPackage[]): void {
   ];
   for (const installedJson of installedJsons) {
     if (existsSync(installedJson)) {
-      collectClaudeManifest(out, installedJson);
+      collectClaudeManifest(out, installedJson, exclude);
     }
   }
   // Always scan the SSH-synced remote bundle too: it can exist alongside a
@@ -459,7 +483,7 @@ export function collectClaude(out: PluginPackage[]): void {
   const remoteRoot = join(home, ".claude", "remote", "plugins");
   if (existsSync(remoteRoot)) {
     const pkg = packageFromDir(remoteRoot, "claude", true);
-    if (pkg) out.push(pkg);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
@@ -477,6 +501,7 @@ export function opencodeCacheRoot(): string {
 export function collectOpencodeCache(
   packagesRoot: string,
   out: PluginPackage[],
+  exclude: string[] = [],
 ): void {
   let pkgEntries: string[];
   try {
@@ -488,7 +513,7 @@ export function collectOpencodeCache(
     const nodeModules = join(packagesRoot, pkgEntry, "node_modules");
     if (!isDirectory(nodeModules)) continue;
     // opencode installed these packages itself, so they are deliberate.
-    collectNodeModules(nodeModules, out, true);
+    collectNodeModules(nodeModules, out, true, exclude);
   }
 }
 
@@ -499,6 +524,7 @@ export function collectNodeModules(
   nodeModulesRoot: string,
   out: PluginPackage[],
   trusted = false,
+  exclude: string[] = [],
 ): void {
   if (!isDirectory(nodeModulesRoot)) return;
   let entries: string[];
@@ -521,11 +547,11 @@ export function collectNodeModules(
       for (const sub of scoped) {
         if (sub.startsWith(".")) continue;
         const pkg = readPackage(join(candidate, sub), "node_modules", trusted);
-        if (pkg) out.push(pkg);
+        if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
       }
     } else {
       const pkg = readPackage(candidate, "node_modules", trusted);
-      if (pkg) out.push(pkg);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }

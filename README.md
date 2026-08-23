@@ -129,6 +129,7 @@ Use the tuple form to configure options:
         "extraRoots": ["/home/user/.vscode-server"],
         "scanCache": true,
         "scanNodeModules": true,
+        "exclude": ["unwanted-plugin"],
         "mcp": false,
         "agents": false
       }
@@ -142,6 +143,7 @@ Use the tuple form to configure options:
 | `extraRoots` | `[]` | Extra root directories to scan (e.g. a non-standard VS Code data location on a remote host). |
 | `scanCache` | `true` | Scan opencode's plugin cache (`~/.cache/opencode/packages/*`) for Agent Plugins packages. |
 | `scanNodeModules` | `false` | Scan the project's `node_modules` (incl. `@scope/*`) for Agent Plugins packages. |
+| `exclude` | `[]` | Package names to skip during discovery, regardless of trust tier. Matches the conformant package's `plugin.json` name, or the directory basename when there is no manifest. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
 

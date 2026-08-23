@@ -18,6 +18,7 @@ import {
   collectOpencodeCache,
   collectVscode,
   collectVscodeCache,
+  collectVscode,
   collectVscodeManifest,
   contains,
   findSkillDirs,
@@ -1165,6 +1166,111 @@ test("planConfig: collapses the same conformant package across sources", () => {
     assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
     assert.equal(plan.skillPaths.length, 1);
     assert.deepEqual(plan.commands.map((c) => c.name), ["s"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("exclude: a named package is suppressed from every source type", () => {
+  const root = makeTemp();
+  try {
+    const name = "blockme";
+    const skills = ["hidden"];
+
+    // claude: installPath in installed_plugins.json
+    const claudeFixture = makePackage(join(root, "claude-fixture"), name, skills);
+    const claudeJson = join(root, "installed_plugins.json");
+    writeFileSync(
+      claudeJson,
+      JSON.stringify({ plugins: { "org/repo": [{ installPath: claudeFixture }] } }),
+    );
+
+    // vscode: pluginUri in installed.json
+    const vscodeFixture = makePackage(join(root, "vscode-fixture"), name, skills);
+    const vscodeJson = join(root, "installed.json");
+    writeFileSync(
+      vscodeJson,
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${vscodeFixture.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    // opencode-cache: {packages}/{name}@{version}/node_modules/{name}
+    const packagesRoot = join(root, "cache-packages");
+    makePackage(join(packagesRoot, `${name}@1.0.0`, "node_modules", name), name, skills);
+
+    // node_modules: project dependency
+    const nmDir = join(root, "project", "node_modules");
+    makePackage(join(nmDir, name), name, skills);
+
+    // extra root: a non-standard VS Code data dir holding the package itself
+    const extraRoot = join(root, "extra-data");
+    makePackage(join(extraRoot, "agent-plugins"), name, skills);
+
+    const expectCollected = (out, label) =>
+      assert.ok(out.some((p) => p.name === name), `${label}: collected without exclude`);
+    const expectSuppressed = (out, label) =>
+      assert.ok(!out.some((p) => p.name === name), `${label}: suppressed with exclude`);
+
+    const claudeOn = [];
+    collectClaudeManifest(claudeOn, claudeJson);
+    const claudeOff = [];
+    collectClaudeManifest(claudeOff, claudeJson, [name]);
+    expectCollected(claudeOn, "claude");
+    expectSuppressed(claudeOff, "claude");
+
+    const vscodeOn = [];
+    collectVscodeManifest(vscodeOn, vscodeJson);
+    const vscodeOff = [];
+    collectVscodeManifest(vscodeOff, vscodeJson, [name]);
+    expectCollected(vscodeOn, "vscode");
+    expectSuppressed(vscodeOff, "vscode");
+
+    const cacheOn = [];
+    collectOpencodeCache(packagesRoot, cacheOn);
+    const cacheOff = [];
+    collectOpencodeCache(packagesRoot, cacheOff, [name]);
+    expectCollected(cacheOn, "opencode-cache");
+    expectSuppressed(cacheOff, "opencode-cache");
+
+    const nmOn = [];
+    collectNodeModules(nmDir, nmOn);
+    const nmOff = [];
+    collectNodeModules(nmDir, nmOff, false, [name]);
+    expectCollected(nmOn, "node_modules");
+    expectSuppressed(nmOff, "node_modules");
+
+    const extraOn = [];
+    collectVscode(extraOn, [extraRoot]);
+    const extraOff = [];
+    collectVscode(extraOff, [extraRoot], [name]);
+    expectCollected(extraOn, "extra");
+    expectSuppressed(extraOff, "extra");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("exclude: legacy packages match on the directory basename", () => {
+  const root = makeTemp();
+  try {
+    // No plugin.json anywhere: packageFromDir falls back to the tree walk and
+    // names the package after the directory basename.
+    const legacy = join(root, "legacy-pkg");
+    mkdirSync(join(legacy, "deep"), { recursive: true });
+    writeFileSync(join(legacy, "deep", "SKILL.md"), "---\nname: hidden\n---\n");
+    const claudeJson = join(root, "installed_plugins.json");
+    writeFileSync(
+      claudeJson,
+      JSON.stringify({ plugins: { "org/repo": [{ installPath: legacy }] } }),
+    );
+    const off = [];
+    collectClaudeManifest(off, claudeJson, ["legacy-pkg"]);
+    assert.equal(off.length, 0);
+    const on = [];
+    collectClaudeManifest(on, claudeJson);
+    assert.equal(on.length, 1);
+    assert.equal(on[0].name, "legacy-pkg");
   } finally {
     cleanup(root);
   }
