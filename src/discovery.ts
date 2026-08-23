@@ -28,6 +28,13 @@ export type PackageSource =
 
 export type PluginPackage = {
   source: PackageSource;
+  /**
+   * Two-tier trust model. True when the content was installed or fetched
+   * deliberately via a host tool or opencode itself (claude/vscode manifests,
+   * opencode's package cache). False when present merely as a side effect
+   * (project node_modules, manifest-less walks over user-supplied extra roots).
+   */
+  trusted: boolean;
   name: string;
   root: string;
   skillDirs: string[];
@@ -106,6 +113,7 @@ export function readSkillInfo(dir: string): SkillInfo | null {
 export function readPackage(
   root: string,
   source: PackageSource,
+  trusted = false,
 ): PluginPackage | null {
   const manifestPath = join(root, "plugin.json");
   if (!isRegularFile(manifestPath)) return null;
@@ -158,6 +166,7 @@ export function readPackage(
 
   return {
     source,
+    trusted,
     name: manifest.name,
     root,
     skillDirs,
@@ -189,69 +198,6 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
   }
 }
 
-// True when `root` directly carries a plugin-like layout: a `skills/` subtree,
-// a flat `agents/` directory of markdown files, a `.claude-plugin/plugin.json`,
-// or bare agent markdown files in the root itself.
-function hasPluginLayout(root: string): boolean {
-  const skillsRoot = join(root, "skills");
-  if (isDirectory(skillsRoot)) {
-    try {
-      if (readdirSync(skillsRoot).some((e) => isRegularFile(join(skillsRoot, e, "SKILL.md")))) {
-        return true;
-      }
-    } catch {
-      // fall through
-    }
-  }
-  if (hasRootAgentFiles(root)) return true;
-  return isRegularFile(join(root, ".claude-plugin", "plugin.json"));
-}
-
-// True when `root` holds flat agent markdown files directly (the current
-// agency-agents layout: engineering/*.md). A file counts as an agent when it
-// has a frontmatter block carrying at least a `name` or `description`, which
-// keeps README/docs out of the agent list.
-function hasRootAgentFiles(root: string): boolean {
-  let entries: string[];
-  try {
-    entries = readdirSync(root);
-  } catch {
-    return false;
-  }
-  return entries.some((e) => {
-    if (!e.endsWith(".md")) return false;
-    const full = join(root, e);
-    if (!isRegularFile(full)) return false;
-    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(full, "utf8"))?.[1];
-    if (!m) return false;
-    return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
-  });
-}
-
-// Returns directories under `root` that are individual plugin roots. This
-// mirrors what VS Code's installed.json points at (each {host}/{org}/{repo}
-// clone, and inside a marketplace like agency-agents each
-// ref_plugins/plugins/<division> dir), so a clone on disk is registered
-// per-plugin instead of as one opaque tree that hides its agents.
-export function findPluginRoots(root: string, out: string[]): void {
-  if (hasPluginLayout(root)) {
-    out.push(root);
-    return;
-  }
-  let entries: string[];
-  try {
-    entries = readdirSync(root);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (entry === ".git" || entry === "node_modules") continue;
-    const full = join(root, entry);
-    if (!isDirectory(full)) continue;
-    findPluginRoots(full, out);
-  }
-}
-
 // True when a legacy Claude Code plugin declares at least one agent, so an
 // agents-only plugin is still discovered even though it ships no skills.
 function hasClaudeAgents(root: string): boolean {
@@ -271,33 +217,21 @@ function hasClaudeAgents(root: string): boolean {
   }
 }
 
-// True when a plugin carries flat agent files: agents/<name>.md or bare
-// <name>.md in the root (agency-agents layouts), which readAgents picks up
-// even without a manifest `agents` field.
-function hasFlatAgents(root: string): boolean {
-  if (hasRootAgentFiles(root)) return true;
-  try {
-    return readdirSync(join(root, "agents")).some((e) => e.endsWith(".md"));
-  } catch {
-    return false;
-  }
-}
-
 // Prefers a conformant package manifest; falls back to a legacy tree walk so
 // non-conformant layouts keep working. Returns null when nothing is found.
 export function packageFromDir(
   root: string,
   source: PackageSource,
+  trusted = false,
 ): PluginPackage | null {
-  const pkg = readPackage(root, source);
+  const pkg = readPackage(root, source, trusted);
   if (pkg) return pkg;
   const skillDirs = new Set<string>();
   findSkillDirs(root, skillDirs, new Set());
-  if (skillDirs.size === 0 && !hasClaudeAgents(root) && !hasFlatAgents(root)) {
-    return null;
-  }
+  if (skillDirs.size === 0 && !hasClaudeAgents(root)) return null;
   return {
     source,
+    trusted,
     name: root.split(/[\\/]/).pop() || root,
     root,
     skillDirs: [...skillDirs],
@@ -376,7 +310,7 @@ export function collectVscodeManifest(
     if (!plugin.pluginUri) continue;
     const dir = vscodePluginPath(plugin.pluginUri);
     if (dir) {
-      const pkg = packageFromDir(dir, "vscode");
+      const pkg = packageFromDir(dir, "vscode", true);
       if (pkg) out.push(pkg);
     }
   }
@@ -408,13 +342,13 @@ export function collectVscodeCache(out: PluginPackage[], cacheJson: string): voi
         : "default";
     const nonceDir = join(parent, key, nonce);
     if (isDirectory(nonceDir)) {
-      const pkg = packageFromDir(nonceDir, "vscode");
+      const pkg = packageFromDir(nonceDir, "vscode", true);
       if (pkg) out.push(pkg);
     } else {
       // Layouts without the {nonce} subdirectory materialize the bundle
       // directly under {key}; walking it only when the nonce dir is absent
       // avoids re-descending into it.
-      const pkg = packageFromDir(join(parent, key), "vscode");
+      const pkg = packageFromDir(join(parent, key), "vscode", true);
       if (pkg) out.push(pkg);
     }
   }
@@ -433,24 +367,18 @@ function sanitizeKey(value: string): string {
 function collectAgentPluginRoot(out: PluginPackage[], root: string): void {
   const installedJson = join(root, "installed.json");
   const cacheJson = join(root, "cache.json");
+  const hasManifest = existsSync(installedJson) || existsSync(cacheJson);
   collectVscodeManifest(out, installedJson);
   collectVscodeCache(out, cacheJson);
-  // `installed.json` is the authoritative record of what VS Code installed;
-  // when it exists, respect it exactly and skip the fallback walk so
-  // cloned-but-not-installed marketplaces stay hidden.
-  //
-  // `cache.json` alone is NOT authoritative: on remote hosts it is just the
-  // LRU of synced skills bundles and is always present, while a marketplace
-  // cloned directly under {host}/{org}/{repo} (newer layouts, or a manual
-  // clone) has no manifest entry at all. Only suppress the walk when
-  // installed.json exists, so any clone actually on disk is still discovered.
-  if (!existsSync(installedJson)) {
-    const pluginRoots: string[] = [];
-    findPluginRoots(root, pluginRoots);
-    for (const pluginRoot of pluginRoots) {
-      const pkg = packageFromDir(pluginRoot, "vscode");
-      if (pkg) out.push(pkg);
-    }
+  // Newer VS Code installs marketplaces directly as {host}/{org}/{repo}
+  // subdirectories with no manifest file at all. Fall back to a full tree walk
+  // only when no metadata exists, so we don't surface skills from cloned-but-
+  // not-installed marketplaces on setups that do have a manifest.
+  if (!hasManifest) {
+    // No host-tool manifest vouches for this content (it covers user-supplied
+    // extra roots too), so it stays in the untrusted tier.
+    const pkg = packageFromDir(root, "vscode", false);
+    if (pkg) out.push(pkg);
   }
 }
 
@@ -476,7 +404,7 @@ export function collectClaudeManifest(
   for (const versions of Object.values(manifest.plugins ?? {})) {
     for (const plugin of versions) {
       if (plugin.installPath) {
-        const pkg = packageFromDir(plugin.installPath, "claude");
+        const pkg = packageFromDir(plugin.installPath, "claude", true);
         if (pkg) out.push(pkg);
       }
     }
@@ -497,19 +425,10 @@ export function collectClaude(out: PluginPackage[]): void {
   // Always scan the SSH-synced remote bundle too: it can exist alongside a
   // local Claude Code install that has its own installed_plugins.json, and
   // the same-source mirror dedup in planConfig collapses any overlap.
-  //
-  // Like the VS Code agent plugin dir, the remote plugins root holds
-  // hash-named plugin directories with no manifest. Walk it with
-  // findPluginRoots so skills and flat agent markdown files are found by
-  // filename wherever they live — no hardcoded folder names needed.
   const remoteRoot = join(home, ".claude", "remote", "plugins");
   if (existsSync(remoteRoot)) {
-    const roots: string[] = [];
-    findPluginRoots(remoteRoot, roots);
-    for (const pluginRoot of roots) {
-      const pkg = packageFromDir(pluginRoot, "claude");
-      if (pkg) out.push(pkg);
-    }
+    const pkg = packageFromDir(remoteRoot, "claude", true);
+    if (pkg) out.push(pkg);
   }
 }
 
@@ -537,7 +456,8 @@ export function collectOpencodeCache(
   for (const pkgEntry of pkgEntries) {
     const nodeModules = join(packagesRoot, pkgEntry, "node_modules");
     if (!isDirectory(nodeModules)) continue;
-    collectNodeModules(nodeModules, out);
+    // opencode installed these packages itself, so they are deliberate.
+    collectNodeModules(nodeModules, out, true);
   }
 }
 
@@ -547,6 +467,7 @@ export function collectOpencodeCache(
 export function collectNodeModules(
   nodeModulesRoot: string,
   out: PluginPackage[],
+  trusted = false,
 ): void {
   if (!isDirectory(nodeModulesRoot)) return;
   let entries: string[];
@@ -568,11 +489,11 @@ export function collectNodeModules(
       }
       for (const sub of scoped) {
         if (sub.startsWith(".")) continue;
-        const pkg = readPackage(join(candidate, sub), "node_modules");
+        const pkg = readPackage(join(candidate, sub), "node_modules", trusted);
         if (pkg) out.push(pkg);
       }
     } else {
-      const pkg = readPackage(candidate, "node_modules");
+      const pkg = readPackage(candidate, "node_modules", trusted);
       if (pkg) out.push(pkg);
     }
   }

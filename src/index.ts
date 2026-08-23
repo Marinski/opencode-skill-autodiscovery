@@ -37,7 +37,7 @@ export default (async (_input, options) => {
         collectOpencodeCache(join(opencodeCacheRoot(), "packages"), packages);
       }
       if (scanNodeModules) {
-        collectNodeModules(join(process.cwd(), "node_modules"), packages);
+        collectNodeModules(join(process.cwd(), "node_modules"), packages, false);
       }
 
       const plan = planConfig(packages, {
