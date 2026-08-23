@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -19,6 +20,7 @@ import {
   collectVscodeCache,
   collectVscodeManifest,
   contains,
+  findSkillDirs,
   packageFromDir,
   planConfig,
   readAgents,
@@ -241,6 +243,55 @@ test("packageFromDir: falls back to a tree walk without a manifest", () => {
     const empty = join(root, "empty");
     mkdirSync(empty, { recursive: true });
     assert.equal(packageFromDir(empty, "claude"), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findSkillDirs: terminates on a self-referential symlink cycle", (t) => {
+  const root = makeTemp();
+  try {
+    mkdirSync(join(root, "solo"), { recursive: true });
+    writeFileSync(join(root, "solo", "SKILL.md"), "---\nname: solo\n---\n");
+    const type = process.platform === "win32" ? "junction" : "dir";
+    try {
+      symlinkSync(root, join(root, "self"), type);
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    // Completing at all is the bound: the old lexical walk recursed on
+    // root/self/self/self/... until stack exhaustion.
+    const expected = new Set([realpathSync(join(root, "solo"))]);
+    assert.deepEqual(out, expected);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findSkillDirs: terminates when a descendant links back to an ancestor", (t) => {
+  const root = makeTemp();
+  try {
+    mkdirSync(join(root, "deep", "inner"), { recursive: true });
+    writeFileSync(
+      join(root, "deep", "inner", "SKILL.md"),
+      "---\nname: inner\n---\n",
+    );
+    const type = process.platform === "win32" ? "junction" : "dir";
+    try {
+      symlinkSync(root, join(root, "deep", "back"), type);
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    // `deep/back` resolves to the already-visited ancestor and must not be
+    // re-walked; only the real skill dir is emitted.
+    const expected = new Set([realpathSync(join(root, "deep", "inner"))]);
+    assert.deepEqual(out, expected);
   } finally {
     cleanup(root);
   }

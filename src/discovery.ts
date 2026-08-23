@@ -178,8 +178,16 @@ export function readPackage(
 }
 
 // Legacy tree walk: every directory containing a SKILL.md, at any depth.
+// Visited and emitted paths are keyed on their real (symlink-resolved) forms,
+// so symlink cycles — self-referential or ancestor-pointing — terminate the
+// branch instead of growing ever-longer lexical paths until stack exhaustion.
 export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
-  const resolved = join(root);
+  let resolved: string;
+  try {
+    resolved = realpathSync(root);
+  } catch {
+    return;
+  }
   if (seen.has(resolved)) return;
   seen.add(resolved);
   let entries: string[];
@@ -192,10 +200,16 @@ export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>)
     if (entry === ".git") continue;
     const full = join(resolved, entry);
     if (!isDirectory(full)) continue;
-    if (isRegularFile(join(full, "SKILL.md"))) {
-      out.add(full);
+    let child: string;
+    try {
+      child = realpathSync(full);
+    } catch {
+      continue;
+    }
+    if (isRegularFile(join(child, "SKILL.md"))) {
+      out.add(child);
     } else {
-      findSkillDirs(full, out, seen);
+      findSkillDirs(child, out, seen);
     }
   }
 }
