@@ -10,7 +10,7 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { log } from "./log.js";
 import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
-import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION } from "./schema.js";
+import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
 import type { AgentConfig } from "./agents.js";
 import type { McpEntry } from "./mcp.js";
 
@@ -625,6 +625,14 @@ export function planConfig(
       const info = readSkillInfo(dir);
       if (!info) continue;
       let name = info.name;
+      // SKILL.md frontmatter is package-supplied input: gate the name before
+      // it becomes any config key (applyConfigPatch writes config.command[name]).
+      if (!validateName(name)) {
+        log(
+          `skipping skill frontmatter for package "${pkg.name}": invalid name "${name}" (must match the identifier pattern and not be a prototype-chain key)`,
+        );
+        continue;
+      }
       const owner = commandOwner.get(name);
       if (owner !== undefined) {
         if (owner === pkg.source) {

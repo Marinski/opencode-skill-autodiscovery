@@ -1463,3 +1463,58 @@ test("exclude: legacy packages match on the directory basename", () => {
     cleanup(root);
   }
 });
+
+test("planConfig: hostile SKILL.md frontmatter names are skipped loudly and leave the config unpolluted", () => {
+  const root = makeTemp();
+  try {
+    // The layout is a normal conformant package; only the SKILL.md
+    // frontmatter names are hostile (prototype key, traversal, control char).
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg" }),
+    );
+    const badNames = ["__proto__", "../../etc/passwd", "bad\u0000name"];
+    badNames.forEach((n, i) => {
+      const dir = join(pkgDir, "skills", `hostile-${i}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "SKILL.md"),
+        `---\nname: ${n}\ndescription: hostile ${i}\n---\n`,
+      );
+    });
+    writeSkillDir(join(pkgDir, "skills", "good"), "good");
+
+    // Capture log() output (console.error) around the planConfig run.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let plan;
+    try {
+      const pkg = readPackage(pkgDir, "node_modules");
+      plan = planConfig([pkg]);
+    } finally {
+      console.error = origError;
+    }
+
+    // Skipped entries: the hostile frontmatter names become no command...
+    assert.deepEqual(plan.commands.map((c) => c.name), ["good"]);
+    // ...and each rejection emitted exactly one loud line naming the
+    // package, the source ('skill frontmatter'), and a reason.
+    assert.equal(logs.length, badNames.length);
+    for (const line of logs) {
+      assert.match(line, /package "pkg"/);
+      assert.match(line, /skill frontmatter/);
+      assert.match(line, /invalid name/);
+    }
+    // Unpolluted config after patching: no hostile keys anywhere, and
+    // Object.prototype untouched (the __proto__ case would otherwise set it).
+    const cfg = {};
+    applyConfigPatch(cfg, plan, { mcp: true, agents: true });
+    assert.deepEqual(Object.keys(cfg.command), ["good"]);
+    assert.equal(Object.getPrototypeOf(cfg.command), Object.prototype);
+  } finally {
+    cleanup(root);
+  }
+});
