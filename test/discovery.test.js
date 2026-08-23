@@ -872,12 +872,12 @@ test("readMcp: __proto__ and constructor server keys are skipped loudly and leav
       assert.match(line, /invalid name/);
     }
     // Unpolluted config after patching: config.mcp holds only the good
-    // server, and Object.prototype is untouched (the __proto__ assignment
-    // would otherwise replace it).
+    // server, Object.prototype is untouched, and the container itself is
+    // prototype-free (built via Object.create(null)).
     const cfg = {};
     applyConfigPatch(cfg, planConfig([pkg]), { mcp: true, agents: false });
     assert.deepEqual(Object.keys(cfg.mcp), ["good"]);
-    assert.equal(Object.getPrototypeOf(cfg.mcp), Object.prototype);
+    assert.equal(Object.getPrototypeOf(cfg.mcp), null);
   } finally {
     cleanup(root);
   }
@@ -1431,11 +1431,12 @@ test("readAgents: __proto__ and constructor manifest agent keys are skipped loud
       assert.match(line, /invalid name/);
     }
     // Unpolluted config after patching: config.agent holds only the good
-    // entry, and Object.prototype is untouched.
+    // entry, Object.prototype is untouched, and the container itself is
+    // prototype-free (built via Object.create(null)).
     const cfg = {};
     applyConfigPatch(cfg, planConfig([pkg]), { mcp: false, agents: true });
     assert.deepEqual(Object.keys(cfg.agent), ["good"]);
-    assert.equal(Object.getPrototypeOf(cfg.agent), Object.prototype);
+    assert.equal(Object.getPrototypeOf(cfg.agent), null);
   } finally {
     cleanup(root);
   }
@@ -1794,10 +1795,62 @@ test("planConfig: hostile SKILL.md frontmatter names are skipped loudly and leav
     }
     // Unpolluted config after patching: no hostile keys anywhere, and
     // Object.prototype untouched (the __proto__ case would otherwise set it).
+    // The command container itself is prototype-free (Object.create(null)).
     const cfg = {};
     applyConfigPatch(cfg, plan, { mcp: true, agents: true });
     assert.deepEqual(Object.keys(cfg.command), ["good"]);
-    assert.equal(Object.getPrototypeOf(cfg.command), Object.prototype);
+    assert.equal(Object.getPrototypeOf(cfg.command), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("hardened write sites: null-prototype containers, quoted template names, and sanitized descriptions survive a JSON round-trip", () => {
+  const root = makeTemp();
+  try {
+    // A conformant package whose SKILL.md description carries terminal
+    // control characters. The write-site defenses must hold regardless of
+    // upstream validation, so the fixture exercises the real pipeline.
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "skills", "spec"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg" }),
+    );
+    writeFileSync(
+      join(pkgDir, "skills", "spec", "SKILL.md"),
+      "---\nname: spec\ndescription: spec\u001b[31mdescription\u001b[0m\n---\n",
+    );
+    const cfg = {};
+    applyConfigPatch(cfg, planConfig([readPackage(pkgDir, "node_modules")]), {
+      mcp: true,
+      agents: true,
+    });
+
+    // Containers are built with Object.create(null): no inherited members,
+    // so __proto__/constructor can never take effect via the prototype chain.
+    assert.equal(Object.getPrototypeOf(cfg.command), null);
+    assert.equal("toString" in cfg.command, false);
+    assert.equal("constructor" in cfg.command, false);
+
+    // The description was sanitized before entering config...
+    assert.equal(cfg.command.spec.description.includes("\u001b"), false);
+    // ...and the skill name appears only as a quoted data value: no
+    // backticks for a hostile name to break out of.
+    assert.equal(
+      cfg.command.spec.template,
+      'Load the "spec" skill and follow its instructions.\nContext: $ARGUMENTS',
+    );
+
+    // The serialized config JSON round-trips without inherited properties:
+    // only own enumerable data keys survive stringify/parse.
+    const rt = JSON.parse(JSON.stringify(cfg));
+    for (const key of Object.keys(rt)) {
+      assert.notEqual(key, "__proto__");
+      assert.notEqual(key, "constructor");
+    }
+    assert.deepEqual(Object.keys(rt.command), ["spec"]);
+    assert.equal(rt.command.spec.description, "specdescription");
   } finally {
     cleanup(root);
   }

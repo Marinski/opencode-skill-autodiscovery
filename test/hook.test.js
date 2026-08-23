@@ -80,7 +80,7 @@ test("config hook: discovers an Agent Plugins package in the project node_module
   assert.equal(found.length, 1);
   assert.ok(cfg.command.s1, "s1 slash command registered");
   assert.ok(cfg.command.s2, "s2 slash command registered");
-  assert.equal(cfg.command.s1.template.includes("Load the `s1` skill"), true);
+  assert.equal(cfg.command.s1.template.includes('Load the "s1" skill'), true);
   assert.equal(cfg.mcp, undefined);
 });
 
@@ -195,7 +195,7 @@ test("config hook: project node_modules is not scanned unless scanNodeModules is
     "skills.paths entry restored with scanNodeModules:true",
   );
   assert.equal(
-    on.command.sneaky.template.includes("Load the `sneaky` skill"),
+    on.command.sneaky.template.includes('Load the "sneaky" skill'),
     true,
     "slash command restored with scanNodeModules:true",
   );
@@ -235,7 +235,7 @@ test("config hook: opencode plugin cache is not scanned unless scanCache is true
     "skills.paths entry restored with scanCache:true",
   );
   assert.equal(
-    on.command.cachesneaky.template.includes("Load the `cachesneaky` skill"),
+    on.command.cachesneaky.template.includes('Load the "cachesneaky" skill'),
     true,
     "slash command restored with scanCache:true",
   );

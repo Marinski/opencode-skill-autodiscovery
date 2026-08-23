@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { log } from "./log.js";
+import { log, sanitize } from "./log.js";
 import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
 import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
@@ -103,7 +103,9 @@ export function readSkillInfo(dir: string): SkillInfo | null {
   };
   const name = field("name");
   if (!name) return null;
-  return { dir, name, description: field("description") ?? "" };
+  // The description is written into config verbatim: strip ANSI escapes and
+  // C0 control characters before it can reach any config surface.
+  return { dir, name, description: sanitize(field("description") ?? "") };
 }
 
 // Reads a conformant Agent Plugins 1.0.0 package from a directory root.
@@ -671,7 +673,10 @@ export function planConfig(
         name,
         description: info.description || `Run the ${info.name} skill`,
         template: [
-          `Load the \`${info.name}\` skill and follow its instructions.`,
+          // The name is a quoted data value (JSON string encoding), never
+          // wrapped in backticks: even a name that skipped validateName
+          // cannot terminate the quote and inject template text.
+          `Load the ${JSON.stringify(info.name)} skill and follow its instructions.`,
           `Context: $ARGUMENTS`,
         ].join("\n"),
       });
@@ -765,7 +770,12 @@ export function applyConfigPatch(
   }
 
   if (plan.commands.length > 0) {
-    config.command ??= {};
+    // Containers are built prototype-free so a key can never resolve to an
+    // inherited member (__proto__/constructor/toString), even if a future
+    // call site skips the upstream validateName gate.
+    config.command ??= Object.create(null) as NonNullable<
+      ConfigLike["command"]
+    >;
     for (const cmd of plan.commands) {
       if (config.command[cmd.name]) continue;
       config.command[cmd.name] = {
@@ -776,7 +786,7 @@ export function applyConfigPatch(
   }
 
   if (enabled.mcp && plan.mcp.length > 0) {
-    config.mcp ??= {};
+    config.mcp ??= Object.create(null) as NonNullable<ConfigLike["mcp"]>;
     for (const { key, entry } of plan.mcp) {
       if (config.mcp[key]) continue;
       config.mcp[key] = entry;
@@ -784,7 +794,7 @@ export function applyConfigPatch(
   }
 
   if (doAgents) {
-    config.agent ??= {};
+    config.agent ??= Object.create(null) as NonNullable<ConfigLike["agent"]>;
     for (const { name, agent } of plan.agents) {
       if (config.agent[name]) continue;
       config.agent[name] = agent;

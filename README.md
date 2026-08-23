@@ -99,9 +99,13 @@ invocable as `/name`, the plugin also registers a command for it (via
 `config.command`) whose template loads the skill and forwards your arguments:
 
 ```markdown
-Load the `spec` skill and follow its instructions.
+Load the "spec" skill and follow its instructions.
 Context: $ARGUMENTS
 ```
+
+The skill name is rendered only as a quoted data value in the template — never
+inside backticks — so a hostile name cannot break out into surrounding
+instruction text.
 
 So `/spec plan the migration` loads the `spec` skill and runs it against
 `plan the migration`. The command's description is taken from the skill's
@@ -213,6 +217,38 @@ Residual risk, stated plainly: approving or rejecting an individual package's
 MCP servers or agents would require an interactive consent surface, which
 opencode's synchronous `config` hook cannot provide. The granularity available
 today is all-or-nothing per component type, narrowed by `exclude`.
+
+### Identifier rules
+
+Every package-supplied identifier that becomes a config key must match the
+same pattern: lowercase letters, digits, `-`, and `.` only (`[a-z0-9.-]`),
+starting and ending with an alphanumeric character, with no `--` or `..`
+runs. The prototype-chain keys `__proto__` and `constructor` are rejected
+outright even though they satisfy the character pattern. This applies to:
+
+- the `plugin.json` manifest `name` (collision namespaces and `exclude`
+  matching)
+- `SKILL.md` frontmatter `name` (slash-command keys)
+- `mcp.json` server keys (`config.mcp` keys)
+- agent manifest keys, `dev.opencode/agents/*.json` filenames, legacy shim
+  agent names, and flat `agents/<name>.md` filenames (`config.agent` keys)
+
+An invalid identifier never aborts discovery: the offending entry is skipped
+with a log line naming the package, its source, and a reason, and legitimate
+entries from the same package still register.
+
+Defense-in-depth at the write sites holds even if a future call site skips
+those checks:
+
+- The `config.command`, `config.mcp`, and `config.agent` containers are built
+  prototype-free (`Object.create(null)`), so no key can ever resolve to an
+  inherited member such as `toString`, and `__proto__`/`constructor` can
+  never take effect through inheritance.
+- The skill name inside a slash-command template is rendered as a quoted data
+  value (JSON string encoding), never wrapped in backticks, so it cannot
+  break out into surrounding instruction text.
+- Frontmatter `description` strings pass through the same control-character
+  sanitizer used for log lines before they enter config.
 
 ### Migrating from 1.x
 
