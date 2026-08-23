@@ -108,8 +108,10 @@ export function readSkillInfo(dir: string): SkillInfo | null {
 
 // Reads a conformant Agent Plugins 1.0.0 package from a directory root.
 // Returns null when the root has no valid plugin.json, so callers can fall
-// back to legacy discovery. The $schema URL and the manifest name are the
-// discriminators that make scanning untrusted directories safe.
+// back to legacy discovery. The $schema URL and the manifest name identify
+// format only — never provenance or safety: any package can copy the
+// literal schema URL. Provenance/safety is tracked separately by the
+// caller-supplied `trusted` flag.
 export function readPackage(
   root: string,
   source: PackageSource,
