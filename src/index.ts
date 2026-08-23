@@ -43,11 +43,15 @@ export default (async (_input, options) => {
         collectNodeModules(join(process.cwd(), "node_modules"), packages, false, exclude);
       }
 
-      const plan = planConfig(packages, {
-        commands: Object.keys(config.command ?? {}),
-        mcp: Object.keys(config.mcp ?? {}),
-        agents: Object.keys(config.agent ?? {}),
-      });
+      const plan = planConfig(
+        packages,
+        {
+          commands: Object.keys(config.command ?? {}),
+          mcp: Object.keys(config.mcp ?? {}),
+          agents: Object.keys(config.agent ?? {}),
+        },
+        { mcp: mcpEnabled },
+      );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });
     },

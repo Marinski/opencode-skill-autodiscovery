@@ -597,6 +597,9 @@ export function planConfig(
     mcp?: Iterable<string>;
     agents?: Iterable<string>;
   } = {},
+  // Mirrors the plugin options: when mcp is false the MCP subsystem is
+  // skipped entirely — no mcp.json parsing, no filesystem side effects.
+  enabled: { mcp?: boolean } = {},
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
@@ -649,31 +652,33 @@ export function planConfig(
   }
 
   const mcp: ConfigPatch["mcp"] = [];
-  const usedMcp = new Set(taken.mcp ?? []);
-  const mcpOwner = new Map<string, PackageSource | "user">();
-  for (const name of taken.mcp ?? []) mcpOwner.set(name, "user");
-  const seenMcpEntry = new Set<string>();
-  for (const pkg of packages) {
-    const entries: Array<{ key: string; entry: McpEntry }> = [];
-    readMcp(pkg, entries);
-    for (const { key, entry } of entries) {
-      const dedupeKey = `${pkg.root}\u0000${key}`;
-      if (seenMcpEntry.has(dedupeKey)) continue;
-      seenMcpEntry.add(dedupeKey);
-      let k = key;
-      const owner = mcpOwner.get(k);
-      if (owner !== undefined) {
-        if (owner === pkg.source) continue;
-        const namespaced = `${pkg.name}/${key}`;
-        if (usedMcp.has(namespaced)) {
-          log(`skipping MCP server "${pkg.name}/${key}": name already taken`);
-          continue;
+  if (enabled.mcp !== false) {
+    const usedMcp = new Set(taken.mcp ?? []);
+    const mcpOwner = new Map<string, PackageSource | "user">();
+    for (const name of taken.mcp ?? []) mcpOwner.set(name, "user");
+    const seenMcpEntry = new Set<string>();
+    for (const pkg of packages) {
+      const entries: Array<{ key: string; entry: McpEntry }> = [];
+      readMcp(pkg, entries);
+      for (const { key, entry } of entries) {
+        const dedupeKey = `${pkg.root}\u0000${key}`;
+        if (seenMcpEntry.has(dedupeKey)) continue;
+        seenMcpEntry.add(dedupeKey);
+        let k = key;
+        const owner = mcpOwner.get(k);
+        if (owner !== undefined) {
+          if (owner === pkg.source) continue;
+          const namespaced = `${pkg.name}/${key}`;
+          if (usedMcp.has(namespaced)) {
+            log(`skipping MCP server "${pkg.name}/${key}": name already taken`);
+            continue;
+          }
+          k = namespaced;
         }
-        k = namespaced;
+        mcpOwner.set(k, pkg.source);
+        usedMcp.add(k);
+        mcp.push({ key: k, entry });
       }
-      mcpOwner.set(k, pkg.source);
-      usedMcp.add(k);
-      mcp.push({ key: k, entry });
     }
   }
 

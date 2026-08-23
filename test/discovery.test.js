@@ -1,6 +1,7 @@
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -662,6 +663,37 @@ test("planConfig: same-source MCP mirrors are not duplicated", () => {
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "node_modules");
     const plan = planConfig([a, b]);
     assert.deepEqual(plan.mcp.map((m) => m.key), ["shared"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
+  const root = makeTemp();
+  try {
+    // stdio entries are the strongest probe for invocation: readMcp's stdio
+    // branch mkdirs the package's plugin-data dir as a side effect, and ESM
+    // bindings can't be monkey-patched with a literal spy.
+    const mcp = {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "stdio", command: "npx", args: ["-y", "server"] },
+      },
+    };
+    const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
+    const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
+
+    // Enabled: readMcp runs — entry planned, side effect performed.
+    const on = planConfig([a], {}, { mcp: true });
+    assert.deepEqual(on.mcp.map((m) => m.key), ["srv"]);
+    assert.equal(existsSync(dataDir), true);
+
+    // Disabled: readMcp must not be invoked at all — nothing planned, no
+    // filesystem side effects (dir removed first so absence proves it).
+    rmSync(dataDir, { recursive: true, force: true });
+    const off = planConfig([a], {}, { mcp: false });
+    assert.deepEqual(off.mcp, []);
+    assert.equal(existsSync(dataDir), false);
   } finally {
     cleanup(root);
   }
