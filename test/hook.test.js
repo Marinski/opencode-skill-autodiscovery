@@ -73,7 +73,7 @@ test("config hook: no-op when nothing is installed", async () => {
 
 test("config hook: discovers an Agent Plugins package in the project node_modules", async () => {
   makePackage(join(envRoot, "node_modules", "dotest"), "dotest", ["s1", "s2"]);
-  const cfg = await runHook({});
+  const cfg = await runHook({ scanNodeModules: true });
   const found = cfg.skills.paths.filter(
     (p) => p.includes("dotest") && (p.endsWith("skills\\s1") || p.endsWith("skills/s1")),
   );
@@ -91,16 +91,16 @@ test("config hook: registers MCP only when the mcp option is enabled", async () 
       srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
     },
   });
-  const off = await runHook({});
+  const off = await runHook({ scanNodeModules: true });
   assert.equal(off.mcp, undefined);
-  const on = await runHook({ mcp: true });
+  const on = await runHook({ scanNodeModules: true, mcp: true });
   assert.equal(on.mcp.srv.type, "remote");
   assert.equal(on.mcp.srv.url, "https://api.example.com/mcp");
 });
 
 test("config hook: does not overwrite a user-defined command", async () => {
   makePackage(join(envRoot, "node_modules", "dotest3"), "dotest3", ["custom"]);
-  const hooks = await plugin({}, {});
+  const hooks = await plugin({}, { scanNodeModules: true });
   const cfg = {
     skills: { paths: [] },
     command: { custom: { template: "user template" } },
@@ -134,10 +134,69 @@ test("config hook: registers agents only when the agents option is enabled", asy
       },
     }),
   );
-  const off = await runHook({});
+  const off = await runHook({ scanNodeModules: true });
   assert.equal(off.agent, undefined);
-  const on = await runHook({ agents: true });
+  const on = await runHook({ scanNodeModules: true, agents: true });
   assert.ok(on.agent.reviewer, "agent registered when agents:true");
   assert.equal(on.agent.reviewer.description, "Reviews diffs");
   assert.equal(on.agent.reviewer.permission, undefined, "permission stripped");
+});
+
+test("config hook: project node_modules is not scanned unless scanNodeModules is true", async () => {
+  // Conformant package carrying every component type the plugin can
+  // register from node_modules: a skill (which would also become a slash
+  // command telling the model to follow the package's instructions), an MCP
+  // server, and a dev.opencode agent.
+  const pkgDir = join(envRoot, "node_modules", "nmdefault");
+  mkdirSync(join(pkgDir, "skills", "sneaky"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "sneaky", "SKILL.md"),
+    "---\nname: sneaky\ndescription: planted\n---\n# sneaky\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "nmdefault",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            rogue: { description: "Planted agent", prompt: "You are planted" },
+          },
+        },
+      },
+    }),
+  );
+  writeFileSync(
+    join(pkgDir, "mcp.json"),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
+      },
+    }),
+  );
+
+  // (a) Default options: the planted package must contribute nothing.
+  const off = await runHook({});
+  assert.equal(
+    off.skills.paths.some((p) => p.includes("nmdefault")),
+    false,
+    "no skills.paths entry from the planted package",
+  );
+  assert.equal(off.command?.sneaky, undefined, "no slash command from the planted package");
+  assert.equal(off.mcp?.srv, undefined, "no config.mcp entry from the planted package");
+  assert.equal(off.agent?.rogue, undefined, "no config.agent entry from the planted package");
+
+  // (b) Opting back in restores collection for the same fixture.
+  const on = await runHook({ scanNodeModules: true });
+  assert.ok(
+    on.skills.paths.some((p) => p.includes("nmdefault")),
+    "skills.paths entry restored with scanNodeModules:true",
+  );
+  assert.equal(
+    on.command.sneaky.template.includes("Load the `sneaky` skill"),
+    true,
+    "slash command restored with scanNodeModules:true",
+  );
 });

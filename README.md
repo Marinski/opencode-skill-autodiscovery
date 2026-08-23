@@ -141,7 +141,7 @@ Use the tuple form to configure options:
 |---|---|---|
 | `extraRoots` | `[]` | Extra root directories to scan (e.g. a non-standard VS Code data location on a remote host). |
 | `scanCache` | `true` | Scan opencode's plugin cache (`~/.cache/opencode/packages/*`) for Agent Plugins packages. |
-| `scanNodeModules` | `true` | Scan the project's `node_modules` (incl. `@scope/*`) for Agent Plugins packages. |
+| `scanNodeModules` | `false` | Scan the project's `node_modules` (incl. `@scope/*`) for Agent Plugins packages. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
 

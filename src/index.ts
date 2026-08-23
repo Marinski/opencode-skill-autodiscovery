@@ -26,7 +26,7 @@ export default (async (_input, options) => {
         ? (options.extraRoots as string[])
         : [];
       const scanCache = options?.scanCache !== false;
-      const scanNodeModules = options?.scanNodeModules !== false;
+      const scanNodeModules = options?.scanNodeModules === true;
       const mcpEnabled = options?.mcp === true;
       const agentsEnabled = options?.agents === true;
 
