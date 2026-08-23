@@ -599,7 +599,8 @@ export function planConfig(
   } = {},
   // Mirrors the plugin options: when mcp is false the MCP subsystem is
   // skipped entirely — no mcp.json parsing, no filesystem side effects.
-  enabled: { mcp?: boolean } = {},
+  // Same for agents: when agents is false readAgents is never invoked.
+  enabled: { mcp?: boolean; agents?: boolean } = {},
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
@@ -683,29 +684,31 @@ export function planConfig(
   }
 
   const agents: ConfigPatch["agents"] = [];
-  const usedAgents = new Set(taken.agents ?? []);
-  const agentOwner = new Map<string, PackageSource | "user">();
-  for (const name of taken.agents ?? []) agentOwner.set(name, "user");
-  const seenAgent = new Set<string>();
-  for (const pkg of packages) {
-    for (const { name, agent } of readAgents(pkg)) {
-      const dedupeKey = `${pkg.root}\u0000${name}`;
-      if (seenAgent.has(dedupeKey)) continue;
-      seenAgent.add(dedupeKey);
-      let agentName = name;
-      const owner = agentOwner.get(agentName);
-      if (owner !== undefined) {
-        if (owner === pkg.source) continue;
-        const namespaced = `${pkg.name}-${agentName}`;
-        if (usedAgents.has(namespaced)) {
-          log(`skipping agent "${pkg.name}/${agentName}": name already taken`);
-          continue;
+  if (enabled.agents !== false) {
+    const usedAgents = new Set(taken.agents ?? []);
+    const agentOwner = new Map<string, PackageSource | "user">();
+    for (const name of taken.agents ?? []) agentOwner.set(name, "user");
+    const seenAgent = new Set<string>();
+    for (const pkg of packages) {
+      for (const { name, agent } of readAgents(pkg)) {
+        const dedupeKey = `${pkg.root}\u0000${name}`;
+        if (seenAgent.has(dedupeKey)) continue;
+        seenAgent.add(dedupeKey);
+        let agentName = name;
+        const owner = agentOwner.get(agentName);
+        if (owner !== undefined) {
+          if (owner === pkg.source) continue;
+          const namespaced = `${pkg.name}-${agentName}`;
+          if (usedAgents.has(namespaced)) {
+            log(`skipping agent "${pkg.name}/${agentName}": name already taken`);
+            continue;
+          }
+          agentName = namespaced;
         }
-        agentName = namespaced;
+        agentOwner.set(agentName, pkg.source);
+        usedAgents.add(agentName);
+        agents.push({ name: agentName, agent });
       }
-      agentOwner.set(agentName, pkg.source);
-      usedAgents.add(agentName);
-      agents.push({ name: agentName, agent });
     }
   }
 

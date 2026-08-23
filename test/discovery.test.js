@@ -699,6 +699,43 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
   }
 });
 
+test("planConfig: skips readAgents entirely when the agents flag is false", () => {
+  const root = makeTemp();
+  try {
+    // readAgents is pure-read (no filesystem side effects to probe) and ESM
+    // bindings can't be monkey-patched with a literal spy, so invocation is
+    // probed via the planned output: an enabled run must plan the agent,
+    // a disabled run must plan nothing.
+    const pkgDir = join(root, "a");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "alpha",
+        extensions: {
+          "dev.opencode": {
+            agents: {
+              reviewer: { description: "Reviews diffs", prompt: "You review code" },
+            },
+          },
+        },
+      }),
+    );
+    const a = readPackage(pkgDir, "node_modules");
+
+    // Enabled: readAgents runs — agent planned.
+    const on = planConfig([a], {}, { agents: true });
+    assert.deepEqual(on.agents.map((x) => x.name), ["reviewer"]);
+
+    // Disabled: readAgents must not be invoked at all — nothing planned.
+    const off = planConfig([a], {}, { agents: false });
+    assert.deepEqual(off.agents, []);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readPackage: rejects names that violate the manifest name constraints", () => {
   const root = makeTemp();
   try {

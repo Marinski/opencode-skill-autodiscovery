@@ -50,7 +50,7 @@ export default (async (_input, options) => {
           mcp: Object.keys(config.mcp ?? {}),
           agents: Object.keys(config.agent ?? {}),
         },
-        { mcp: mcpEnabled },
+        { mcp: mcpEnabled, agents: agentsEnabled },
       );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });
