@@ -147,6 +147,17 @@ Use the tuple form to configure options:
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
 
+Both scan flags default to `false` for supply-chain reasons: a discovered
+skill's `SKILL.md` becomes prompt material in your sessions, so anything that
+plants a skill plants model-facing instructions — and neither transitive npm
+dependencies (which land in `node_modules` without any install script running)
+nor the shared `~/.cache/opencode/packages` directory (populated by every
+project on the machine) requires a manifest you ever reviewed. This is the
+OWASP LLM01 risk arriving via the software supply chain; both sources are
+therefore opt-in, while manifest-mediated sources (Claude Code plugins, VS
+Code agent plugins) stay default-on because their manifests record deliberate,
+host-vouched installs.
+
 ## Threat model
 
 Discovery reads manifests from well-known locations and registers what it finds
