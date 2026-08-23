@@ -200,3 +200,43 @@ test("config hook: project node_modules is not scanned unless scanNodeModules is
     "slash command restored with scanNodeModules:true",
   );
 });
+
+test("config hook: opencode plugin cache is not scanned unless scanCache is true", async () => {
+  // Conformant package planted where opencode itself installs npm plugins:
+  // {cache}/opencode/packages/{name}@{version}/node_modules/{name}
+  const pkgDir = join(
+    envRoot,
+    ".cache",
+    "opencode",
+    "packages",
+    "cachetest@1.0.0",
+    "node_modules",
+    "cachetest",
+  );
+  makePackage(pkgDir, "cachetest", ["cachesneaky"]);
+
+  // (a) Default options: the cached package must contribute nothing.
+  const off = await runHook({});
+  assert.equal(
+    off.skills.paths.some((p) => p.includes("cachetest")),
+    false,
+    "no skills.paths entry from the planted package",
+  );
+  assert.equal(
+    off.command?.cachesneaky,
+    undefined,
+    "no slash command from the planted package",
+  );
+
+  // (b) Opting back in restores collection for the same fixture.
+  const on = await runHook({ scanCache: true });
+  assert.ok(
+    on.skills.paths.some((p) => p.includes("cachetest")),
+    "skills.paths entry restored with scanCache:true",
+  );
+  assert.equal(
+    on.command.cachesneaky.template.includes("Load the `cachesneaky` skill"),
+    true,
+    "slash command restored with scanCache:true",
+  );
+});

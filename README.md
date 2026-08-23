@@ -141,7 +141,7 @@ Use the tuple form to configure options:
 | Option | Default | Meaning |
 |---|---|---|
 | `extraRoots` | `[]` | Extra root directories to scan (e.g. a non-standard VS Code data location on a remote host). |
-| `scanCache` | `true` | Scan opencode's plugin cache (`~/.cache/opencode/packages/*`) for Agent Plugins packages. |
+| `scanCache` | `false` | Scan opencode's plugin cache (`~/.cache/opencode/packages/*`) for Agent Plugins packages. |
 | `scanNodeModules` | `false` | Scan the project's `node_modules` (incl. `@scope/*`) for Agent Plugins packages. |
 | `exclude` | `[]` | Package names to skip during discovery, regardless of trust tier. Matches the conformant package's `plugin.json` name, or the directory basename when there is no manifest. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
@@ -217,7 +217,7 @@ picked up from the project's `node_modules`, they must now opt in explicitly:
 
 Prefer shipping your package as a regular opencode plugin
 (`"plugin": ["your-package"]`) instead: opencode installs it into its own cache,
-where this plugin discovers it by default (`scanCache: true`, unchanged) — no
+where you can pick it up explicitly with `"scanCache": true` — no
 scan of the dependency tree required.
 
 ## VPS / remote hosts (SSH sessions)
