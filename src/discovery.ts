@@ -184,12 +184,19 @@ function isExcluded(pkg: PluginPackage, exclude: string[]): boolean {
   return exclude.includes(pkg.name);
 }
 
-// Legacy tree walk: every directory containing a SKILL.md, at any depth.
-// Visited and emitted paths are keyed on their real (symlink-resolved) forms,
-// so symlink cycles — self-referential or ancestor-pointing — terminate the
-// branch instead of growing ever-longer lexical paths until stack exhaustion.
-// Candidates whose real location resolves outside the starting root are
-// skipped, mirroring the containment guarantee of readPackage.
+// Belt-and-braces bound for the legacy walk. Correctness rests entirely on
+// real-path dedupe below (symlink cycles terminate because every visited path
+// is keyed on its resolved form); this cap only stops pathological deep trees
+// from exhausting the stack, and is not load-bearing for that guarantee.
+const MAX_WALK_DEPTH = 16;
+
+// Legacy tree walk: every directory containing a SKILL.md, down to a shallow
+// depth cap (see MAX_WALK_DEPTH). Visited and emitted paths are keyed on their
+// real (symlink-resolved) forms, so symlink cycles — self-referential or
+// ancestor-pointing — terminate the branch instead of growing ever-longer
+// lexical paths until stack exhaustion. Candidates whose real location
+// resolves outside the starting root are skipped, mirroring the containment
+// guarantee of readPackage.
 export function findSkillDirs(root: string, out: Set<string>, seen: Set<string>) {
   let resolved: string;
   try {
@@ -205,7 +212,9 @@ function findSkillDirsUnder(
   dir: string,
   out: Set<string>,
   seen: Set<string>,
+  depth = 0,
 ) {
+  if (depth > MAX_WALK_DEPTH) return;
   if (seen.has(dir)) return;
   seen.add(dir);
   let entries: string[];
@@ -231,7 +240,7 @@ function findSkillDirsUnder(
     if (isRegularFile(join(child, "SKILL.md"))) {
       out.add(child);
     } else {
-      findSkillDirsUnder(realRoot, child, out, seen);
+      findSkillDirsUnder(realRoot, child, out, seen, depth + 1);
     }
   }
 }

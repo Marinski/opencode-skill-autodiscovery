@@ -429,6 +429,25 @@ test("findSkillDirs: symlinked dir outside the walk root is never emitted", (t) 
   }
 });
 
+test("findSkillDirs: depth cap stops the descent past 16 levels", () => {
+  const root = makeTemp();
+  try {
+    // A plain nested chain (no symlinks): a skill well inside the cap is
+    // found, one far below it is not, and the walk always terminates.
+    const segments = Array.from({ length: 20 }, (_, i) => `l${i}`);
+    writeSkillDir(join(root, ...segments, "too-deep"), "too-deep");
+    writeSkillDir(join(root, ...segments.slice(0, 14), "in-cap"), "in-cap");
+
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    assert.deepEqual(goldenPaths(root, out), [
+      [...segments.slice(0, 14), "in-cap"].join("/"),
+    ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectNodeModules: finds unscoped and scoped packages only", () => {
   const root = makeTemp();
   try {
