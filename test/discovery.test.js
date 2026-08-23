@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import {
   applyConfigPatch,
   collectClaude,
@@ -60,6 +60,46 @@ function makePackage(root, name, skills = [], mcp = null) {
     writeFileSync(join(root, "mcp.json"), JSON.stringify(mcp));
   }
   return root;
+}
+
+// Shared scaffolding for temp-dir fixtures. makeTemp/cleanup above own
+// creation and removal; these two build fixture contents on top of them.
+
+// Creates `dir` (recursively) holding a minimal valid SKILL.md.
+function writeSkillDir(dir, name) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "SKILL.md"),
+    `---\nname: ${name}\ndescription: ${name} description\n---\n`,
+  );
+}
+
+// Probes whether this platform allows the symlink/junction type the fixtures
+// need. Callers must SKIP (never fail) when this returns false, e.g. Windows
+// CI runners without symlink privilege.
+function supportsSymlinks() {
+  const probe = makeTemp("oc-symlinks-");
+  try {
+    const target = join(probe, "target");
+    mkdirSync(target);
+    symlinkSync(
+      target,
+      join(probe, "link"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    return true;
+  } catch {
+    return false;
+  } finally {
+    cleanup(probe);
+  }
+}
+
+// Renders an emitted dir as a POSIX-style path relative to the walk root so
+// golden lists stay stable across platforms and mkdtemp randomness.
+function goldenPaths(root, out) {
+  const base = realpathSync(root);
+  return [...out].map((d) => relative(base, d).split(sep).join("/")).sort();
 }
 
 before(() => {
@@ -224,6 +264,66 @@ test("readPackage: symlinked skill dir outside the root is skipped", (t) => {
     const pkg = readPackage(pkgDir, "node_modules");
     assert.ok(pkg);
     assert.deepEqual(pkg.skillDirs, []);
+  } finally {
+    cleanup(root);
+  }
+});
+
+// --- Legacy-walker parity baseline ------------------------------------------
+// These fixtures pin findSkillDirs' CURRENT output for legitimate nested
+// legacy layouts (nothing escapes, no cycles). The golden lists are the
+// before/after contract for later walker changes: update them only alongside
+// an intentional, reviewed behavior change — never to make a test pass.
+
+test("findSkillDirs parity: nested legacy layout pins the emitted skill dirs", () => {
+  const root = makeTemp();
+  try {
+    writeSkillDir(join(root, "top-a"), "top-a");
+    // A skill dir below another skill dir is not reached: the walk does not
+    // descend past an emitted SKILL.md.
+    writeSkillDir(join(root, "top-a", "nested-b"), "nested-b");
+    writeSkillDir(join(root, "group", "mid-c"), "mid-c");
+    writeSkillDir(join(root, "group", "deeper", "deep-d"), "deep-d");
+    // Noise that must stay out of the golden list.
+    writeFileSync(join(root, "README.md"), "a file, not a dir");
+    mkdirSync(join(root, "empty-dir"));
+
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    assert.deepEqual(goldenPaths(root, out), [
+      "group/deeper/deep-d",
+      "group/mid-c",
+      "top-a",
+    ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findSkillDirs parity: internal symlink aliases emit the real skill dir once", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  try {
+    writeSkillDir(join(root, "skills-a"), "skills-a");
+    writeSkillDir(join(root, "shared", "target-b"), "target-b");
+    symlinkSync(
+      join(root, "shared"),
+      join(root, "alias"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    // The alias resolves inside the root, so it stays legitimate; the emitted
+    // path is the real one (shared/target-b) and appears exactly once,
+    // regardless of whether readdir visits `alias` or `shared` first.
+    assert.deepEqual(goldenPaths(root, out), [
+      "shared/target-b",
+      "skills-a",
+    ]);
   } finally {
     cleanup(root);
   }
