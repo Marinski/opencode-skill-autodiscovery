@@ -147,6 +147,79 @@ Use the tuple form to configure options:
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
 
+## Threat model
+
+Discovery reads manifests from well-known locations and registers what it finds
+into your session config. Not all sources are equally trustworthy, so they are
+split into two tiers:
+
+**Trusted by default** — content a host tool or opencode itself installed
+deliberately, vouched for by a manifest:
+
+- Claude Code plugins (`installed_plugins.json`, local and remote)
+- VS Code agent plugins recorded in `installed.json` / `cache.json`
+- packages in opencode's own plugin cache (`~/.cache/opencode/packages/*`),
+  which exist because your config asked opencode to fetch them
+
+**Untrusted by default** — content present merely as a side effect:
+
+- the project's `node_modules`: dependencies install transitively, so anything
+  in the tree can ship skills, MCP servers, or agents. Scanning it is **off by
+  default**; restore it explicitly with `"scanNodeModules": true`.
+- user-supplied `extraRoots`: the plugin cannot vouch for whatever you point it at.
+- manifest-less directory walks (e.g. cloned-but-uninstalled marketplace folders).
+
+Trust decides whether content gets *registered*, not whether it is safe: a
+registered skill's `SKILL.md` becomes prompt material in your sessions. The
+`$schema` check identifies format only — never provenance or safety. Any package
+can copy the literal schema URL, so a conformant manifest proves nothing about
+who wrote it.
+
+### `mcp` and `agents` trust everything they find
+
+Both flags are single global switches: enabling one trusts **every** discovered
+package that ships the matching config. There is no per-package consent step.
+
+- `mcp: true` registers every conformant package's `mcp.json`; stdio entries
+  execute commands on your machine.
+- `agents: true` registers package-supplied agents essentially verbatim within
+  the schema: a package can set `mode: "primary"` (making itself a primary
+  agent) and arbitrary `tools` booleans such as `"write": true`. Only
+  `permission` blocks are dropped.
+
+Pair these flags with `exclude` to carve out packages you do not want
+registered:
+
+```json
+{
+  "plugin": [
+    ["opencode-skill-autodiscovery", { "mcp": true, "agents": true, "exclude": ["unwanted-package"] }]
+  ]
+}
+```
+
+Residual risk, stated plainly: approving or rejecting an individual package's
+MCP servers or agents would require an interactive consent surface, which
+opencode's synchronous `config` hook cannot provide. The granularity available
+today is all-or-nothing per component type, narrowed by `exclude`.
+
+### Migrating from 1.x
+
+`scanNodeModules` used to default to `true`; it now defaults to `false`. If you
+distribute an Agent Plugins package via npm and consumers relied on it being
+picked up from the project's `node_modules`, they must now opt in explicitly:
+
+```json
+{
+  "plugin": [["opencode-skill-autodiscovery", { "scanNodeModules": true }]]
+}
+```
+
+Prefer shipping your package as a regular opencode plugin
+(`"plugin": ["your-package"]`) instead: opencode installs it into its own cache,
+where this plugin discovers it by default (`scanCache: true`, unchanged) — no
+scan of the dependency tree required.
+
 ## VPS / remote hosts (SSH sessions)
 
 Discovery is **machine-local**: a remote session only sees the skills, agents,
