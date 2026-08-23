@@ -1327,6 +1327,185 @@ test("readAgents: dev.opencode agents win over flat agents with the same name", 
   }
 });
 
+test("readAgents: __proto__ and constructor manifest agent keys are skipped loudly and leave config.agent clean", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    // Object.fromEntries creates "__proto__" as an own data property (a plain
+    // object literal would set the prototype instead), so it survives
+    // JSON.stringify into plugin.json exactly as a hostile package would
+    // ship it.
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: Object.fromEntries([
+              ["__proto__", { description: "evil" }],
+              ["constructor", { description: "evil" }],
+              ["Bad_Name", { description: "bad chars" }],
+              ["good", { description: "Reviews diffs" }],
+            ]),
+          },
+        },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) around the readAgents run.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    // Skipped entries: only the legitimate agent survives...
+    assert.deepEqual(agents.map((a) => a.name), ["good"]);
+    // ...and each rejection emitted exactly one loud line naming the
+    // package, its source, and a reason.
+    assert.equal(logs.length, 3);
+    for (const line of logs) {
+      assert.match(line, /package "pkg"/);
+      assert.match(line, /node_modules/);
+      assert.match(line, /invalid name/);
+    }
+    // Unpolluted config after patching: config.agent holds only the good
+    // entry, and Object.prototype is untouched.
+    const cfg = {};
+    applyConfigPatch(cfg, planConfig([pkg]), { mcp: false, agents: true });
+    assert.deepEqual(Object.keys(cfg.agent), ["good"]);
+    assert.equal(Object.getPrototypeOf(cfg.agent), Object.prototype);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: invalid dev.opencode/agents/<name>.json filenames are skipped loudly", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "dev.opencode", "agents"), { recursive: true });
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    writeFileSync(
+      join(pkgDir, "dev.opencode", "agents", "bad..name.json"),
+      JSON.stringify({ description: "Evil", prompt: "Evil prompt" }),
+    );
+    writeFileSync(
+      join(pkgDir, "dev.opencode", "agents", "triage.json"),
+      JSON.stringify({ description: "Triages issues", prompt: "You triage" }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents.map((a) => a.name), ["triage"]);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /package "pkg"/);
+    assert.match(logs[0], /node_modules/);
+    assert.match(logs[0], /invalid name "bad\.\.name"/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: shim manifest agent names on legacy roots are skipped loudly before any AGENTS.md lookup", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "legacy");
+    mkdirSync(join(pkgDir, ".claude-plugin"), { recursive: true });
+    mkdirSync(join(pkgDir, "agents", "explorer"), { recursive: true });
+    // Object.fromEntries keeps "__proto__" an own property through JSON;
+    // "../escape" is a traversal-shaped key that must never reach the
+    // agents/<name>/AGENTS.md path join.
+    writeFileSync(
+      join(pkgDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "legacy",
+        agents: Object.fromEntries([
+          ["__proto__", { description: "evil" }],
+          ["../escape", { description: "traversal" }],
+          ["explorer", { description: "Explores the codebase" }],
+        ]),
+      }),
+    );
+    writeFileSync(join(pkgDir, "agents", "explorer", "AGENTS.md"), "# Explorer\n\nFind things.\n");
+    const pkg = packageFromDir(pkgDir, "node_modules");
+    assert.ok(pkg, "agents-only plugin is discovered");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents.map((a) => a.name), ["explorer"]);
+    assert.equal(agents[0].agent.prompt, "# Explorer\n\nFind things.\n");
+    assert.equal(logs.length, 2);
+    for (const line of logs) {
+      assert.match(line, /package "legacy"/);
+      assert.match(line, /invalid name/);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: invalid flat agents/<name>.md filenames are skipped loudly", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+    writeFileSync(join(pkgDir, "skills", "s", "SKILL.md"), "---\nname: s\n---\n");
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "agents", "engineering-code-reviewer.md"),
+      "---\ndescription: Expert code reviewer\n---\nYou are Code Reviewer.",
+    );
+    writeFileSync(
+      join(pkgDir, "agents", "Bad--Name.md"),
+      "---\ndescription: Evil\n---\nEvil body",
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents.map((a) => a.name), ["engineering-code-reviewer"]);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /package "pkg"/);
+    assert.match(logs[0], /invalid name "Bad--Name"/);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("planConfig: namespaces agent collisions across distinct sources", () => {
   const root = makeTemp();
   try {
