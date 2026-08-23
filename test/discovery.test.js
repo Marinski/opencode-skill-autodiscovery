@@ -778,6 +778,57 @@ test("readMcp: rejects non-http(s) urls for remote transports", () => {
   }
 });
 
+test("readMcp: __proto__ and constructor server keys are skipped loudly and leave config.mcp clean", () => {
+  const root = makeTemp();
+  try {
+    // Object.fromEntries creates "__proto__" as an own data property (a plain
+    // object literal would set the prototype instead), so it survives
+    // JSON.stringify into mcp.json exactly as a hostile package would ship it.
+    const servers = Object.fromEntries([
+      ["__proto__", { type: "streamable-http", url: "https://evil.example.com/proto" }],
+      ["constructor", { type: "streamable-http", url: "https://evil.example.com/ctor" }],
+      ["good", { type: "streamable-http", url: "https://api.example.com/mcp" }],
+    ]);
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: servers,
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) around the readMcp run.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // Skipped entries: only the legitimate server is planned...
+    assert.deepEqual(out.map((e) => e.key), ["good"]);
+    // ...and each rejection emitted exactly one loud line naming the
+    // package, its source, and a reason.
+    assert.equal(logs.length, 2);
+    for (const line of logs) {
+      assert.match(line, /package "pkg"/);
+      assert.match(line, /node_modules/);
+      assert.match(line, /invalid name/);
+    }
+    // Unpolluted config after patching: config.mcp holds only the good
+    // server, and Object.prototype is untouched (the __proto__ assignment
+    // would otherwise replace it).
+    const cfg = {};
+    applyConfigPatch(cfg, planConfig([pkg]), { mcp: true, agents: false });
+    assert.deepEqual(Object.keys(cfg.mcp), ["good"]);
+    assert.equal(Object.getPrototypeOf(cfg.mcp), Object.prototype);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectClaudeManifest: resolves installPaths from installed_plugins.json", () => {
   const root = makeTemp();
   try {

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "./log.js";
-import { MCP_SCHEMA, VERSION } from "./schema.js";
+import { MCP_SCHEMA, VERSION, validateName } from "./schema.js";
 import type { PluginPackage } from "./discovery.js";
 
 export type McpEntry =
@@ -101,6 +101,14 @@ export function readMcp(
   const dataDir = pluginDataRoot(pkg.name);
   const servers = parsed.mcpServers as Record<string, unknown>;
   for (const [name, serverValue] of Object.entries(servers)) {
+    // mcp.json server keys are package-supplied input: gate the name before
+    // it becomes any config key (applyConfigPatch writes config.mcp[key]).
+    if (!validateName(name)) {
+      log(
+        `skipping MCP server key for package "${pkg.name}" (${pkg.source}): invalid name "${name}" (must match the identifier pattern and not be a prototype-chain key)`,
+      );
+      continue;
+    }
     if (typeof serverValue !== "object" || serverValue === null) {
       log(`skipping MCP server "${pkg.name}/${name}": invalid entry`);
       continue;
