@@ -264,6 +264,24 @@ function hasClaudeAgents(root: string): boolean {
   }
 }
 
+// Sanitizes the legacy directory-basename package-name fallback before it
+// feeds collision namespaces or dedupe keys: names that already satisfy
+// NAME_PATTERN pass through untouched; anything else is stripped down to
+// NAME_PATTERN-safe characters (characters outside [a-z0-9.-] removed,
+// `--`/`..` runs collapsed, edges trimmed) and rejected outright when the
+// result is empty or a prototype-chain key, falling back to a fixed safe
+// identifier. Legacy packages keep their skills even when their directory
+// name is hostile.
+function legacyFallbackName(basename: string): string {
+  if (validateName(basename)) return basename;
+  const cleaned = basename
+    .replace(/[^a-z0-9.-]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[.-]+|[.-]+$/g, "");
+  return validateName(cleaned) ?? "legacy";
+}
+
 // Prefers a conformant package manifest; falls back to a legacy tree walk so
 // non-conformant layouts keep working. Returns null when nothing is found.
 export function packageFromDir(
@@ -279,7 +297,7 @@ export function packageFromDir(
   return {
     source,
     trusted,
-    name: root.split(/[\\/]/).pop() || root,
+    name: legacyFallbackName(root.split(/[\\/]/).pop() ?? ""),
     root,
     skillDirs: [...skillDirs],
   };

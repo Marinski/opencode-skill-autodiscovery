@@ -350,6 +350,60 @@ test("packageFromDir: falls back to a tree walk without a manifest", () => {
   }
 });
 
+test("packageFromDir: valid legacy basenames keep their name and collision namespace", () => {
+  const root = makeTemp();
+  try {
+    const dir = join(root, "legacy-pkg");
+    writeSkillDir(join(dir, "skills", "run"), "run");
+    const pkg = packageFromDir(dir, "claude");
+    assert.ok(pkg);
+    assert.equal(pkg.name, "legacy-pkg");
+    // A taken command name forces the `${pkg.name}-${skill}` collision
+    // namespace, which must stay identical to the pre-sanitization behavior.
+    const plan = planConfig([pkg], { commands: ["run"] });
+    assert.deepEqual(
+      plan.commands.map((c) => c.name),
+      ["legacy-pkg-run"],
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("packageFromDir: malformed legacy basenames are neutralized, never trusted raw", () => {
+  const root = makeTemp();
+  try {
+    // Hostile-but-creatable directory names (cross-platform safe characters).
+    for (const [raw, expected] of [
+      ["weird_pkg!!", "weirdpkg"], // underscores + punctuation stripped
+      ["--dashes--", "dashes"], // non-alphanumeric edges trimmed
+      ["..dots", "dots"], // leading dot run trimmed
+      ["my..pkg", "my.pkg"], // interior `..` collapsed
+      ["constructor", "legacy"], // prototype-chain key rejected outright
+      ["__proto__", "proto"], // underscores stripped -> safe, non-prototype key
+    ]) {
+      const dir = join(root, raw);
+      writeSkillDir(join(dir, "skills", "solo"), "solo");
+      const pkg = packageFromDir(dir, "claude");
+      assert.ok(pkg, `package missing for ${JSON.stringify(raw)}`);
+      assert.equal(
+        pkg.name,
+        expected,
+        `basename ${JSON.stringify(raw)} not sanitized as expected`,
+      );
+      assert.notEqual(pkg.name, raw, "raw basename was trusted verbatim");
+      // The sanitized name is a valid identifier and the skills survived.
+      assert.match(
+        pkg.name,
+        /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/,
+      );
+      assert.equal(pkg.skillDirs.length, 1);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("findSkillDirs: terminates on a self-referential symlink cycle", (t) => {
   const root = makeTemp();
   try {
