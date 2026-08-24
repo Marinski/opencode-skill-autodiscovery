@@ -1,6 +1,6 @@
 # opencode-skill-autodiscovery
 
-An [opencode](https://opencode.ai) plugin that auto-discovers skills, agents, and MCP servers installed by VS Code agent plugins, Claude Code plugins, and [Agent Plugins 1.0.0](https://agent-plugins.org) conformant packages on the current machine, and registers them with opencode so they appear in every session. Discovered skills are registered with opencode's `skills.paths` and also exposed as `/skill-name` slash commands that load the skill and route the rest of your message through it. Discovered agents are registered as `config.agent.<name>` (opt-in), and discovered MCP servers are mapped onto `config.mcp` (opt-in). Works with both `opencode.json` and `opencode.jsonc` config files.
+An [opencode](https://opencode.ai) plugin that auto-discovers skills, agents, and MCP servers installed by VS Code agent plugins, Claude Code plugins, and [Agent Plugins 1.0.0](https://agent-plugins.org) conformant packages on the current machine, and registers them with opencode so they appear in every session. Discovered skills are registered with opencode's `skills.paths` and also exposed as `/skill-name` slash commands that load the skill and route the rest of your message through it. Discovered agents are registered as `config.agent.<name>` (opt-in), and discovered MCP servers are mapped onto `config.mcp` (opt-in). Works with both `opencode.jsonc` and `opencode.json` config files.
 
 ## Why
 
@@ -39,7 +39,7 @@ Agents discovered without an explicit `mode` default to opencode's `all`, so the
 
 Discovered agents are registered as `config.agent.<name>` with the same rules as commands: user-defined agents are never overwritten, same-source mirrors are collapsed, and cross-source collisions become `<package>-<agent>`.
 
-**Trust note:** a package-supplied `permission` block is always dropped — agent permissions are too powerful to inherit from a package by default. If you need one, define the agent yourself in `opencode.json` (which always wins).
+**Trust note:** a package-supplied `permission` block is always dropped — agent permissions are too powerful to inherit from a package by default. If you need one, define the agent yourself in `opencode.jsonc` (which always wins).
 
 Agent `color` values are normalized: bare CSS names (e.g. `orange`, `purple`) are mapped to the `#RRGGBB` hex literals opencode accepts, hex shorthand (`#0f8`) is expanded, and anything else is dropped rather than risk rejecting the whole config.
 
@@ -56,7 +56,7 @@ So `/spec plan the migration` loads the `spec` skill and runs it against `plan t
 
 ## Install
 
-Add the package name to the `plugin` array in your `opencode.json` (or `opencode.jsonc` — both are supported):
+Add the package name to the `plugin` array in your `opencode.jsonc` (or `opencode.json` — both are supported):
 
 ```json
 {
@@ -102,7 +102,7 @@ Discovery is **machine-local**: a remote session only sees the skills, agents, a
 npm install -g opencode-ai
 
 # 2. Install this plugin globally. The -g flag targets the machine-wide config;
-#    without it, opencode writes a project-scoped .opencode/opencode.json
+#    without it, opencode writes a project-scoped .opencode/opencode.jsonc
 #    instead (easy to miss, because the plugin looks installed but only for
 #    that one directory).
 opencode plugin opencode-skill-autodiscovery -g
@@ -111,7 +111,7 @@ opencode plugin opencode-skill-autodiscovery -g
 #    remote's own cache.
 ```
 
-Or hand-edit the remote's global config (`~/.config/opencode/opencode.json`):
+Or hand-edit the remote's global config (`~/.config/opencode/opencode.jsonc`):
 
 ```json
 {
