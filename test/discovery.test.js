@@ -19,7 +19,6 @@ import {
   collectOpencodeCache,
   collectVscode,
   collectVscodeCache,
-  collectVscode,
   collectVscodeManifest,
   contains,
   findSkillDirs,
