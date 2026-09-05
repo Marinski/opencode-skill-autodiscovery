@@ -47,9 +47,18 @@ export type SkillInfo = { dir: string; name: string; description: string };
 
 export type ConfigPatch = {
   skillPaths: string[];
-  commands: Array<{ name: string; description: string; template: string }>;
-  mcp: Array<{ key: string; entry: McpEntry }>;
-  agents: Array<{ name: string; agent: AgentConfig }>;
+  // Parallel to skillPaths: per-path provenance (the owning package's
+  // `trusted` flag) so registration code can tell deliberate installs from
+  // side-effect discovery.
+  skillTrust: Array<{ dir: string; trusted: boolean }>;
+  commands: Array<{
+    name: string;
+    description: string;
+    template: string;
+    trusted: boolean;
+  }>;
+  mcp: Array<{ key: string; entry: McpEntry; trusted: boolean }>;
+  agents: Array<{ name: string; agent: AgentConfig; trusted: boolean }>;
 };
 
 export type ConfigLike = {
@@ -709,12 +718,14 @@ export function planConfig(
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
+  const skillTrust: ConfigPatch["skillTrust"] = [];
   const seenDir = new Set<string>();
   for (const pkg of packages) {
     for (const dir of pkg.skillDirs) {
       if (seenDir.has(dir)) continue;
       seenDir.add(dir);
       skillPaths.push(dir);
+      skillTrust.push({ dir, trusted: pkg.trusted });
     }
   }
 
@@ -764,6 +775,7 @@ export function planConfig(
           `Load the ${JSON.stringify(info.name)} skill and follow its instructions.`,
           `Context: $ARGUMENTS`,
         ].join("\n"),
+        trusted: pkg.trusted,
       });
     }
   }
@@ -794,7 +806,7 @@ export function planConfig(
         }
         mcpOwner.set(k, pkg.source);
         usedMcp.add(k);
-        mcp.push({ key: k, entry });
+        mcp.push({ key: k, entry, trusted: pkg.trusted });
       }
     }
   }
@@ -823,12 +835,12 @@ export function planConfig(
         }
         agentOwner.set(agentName, pkg.source);
         usedAgents.add(agentName);
-        agents.push({ name: agentName, agent });
+        agents.push({ name: agentName, agent, trusted: pkg.trusted });
       }
     }
   }
 
-  return { skillPaths, commands, mcp, agents };
+  return { skillPaths, skillTrust, commands, mcp, agents };
 }
 
 // Applies a computed plan to the resolved config. Never overwrites user-defined
