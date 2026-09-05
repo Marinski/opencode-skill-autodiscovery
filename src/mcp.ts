@@ -160,9 +160,12 @@ export function readMcp(
       } catch {
         // Non-fatal: the subprocess env still points at the (uncreated) dir.
       }
+      // Safe floor: package-supplied servers are registered disabled so
+      // opencode never spawns the package-declared binary at startup on
+      // discovery alone.
       out.push({
         key: name,
-        entry: { type: "local", command: [command, ...args], environment, enabled: true },
+        entry: { type: "local", command: [command, ...args], environment, enabled: false },
       });
     } else if (server.type === "streamable-http") {
       if (hasUnknownKeys(server, HTTP_KEYS)) {
@@ -183,7 +186,7 @@ export function readMcp(
           type: "remote",
           url: server.url,
           headers: collectHeaders(server.headers),
-          enabled: true,
+          enabled: false,
         },
       });
     } else if (server.type === "sse") {

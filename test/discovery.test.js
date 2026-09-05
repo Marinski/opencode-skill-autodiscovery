@@ -569,7 +569,7 @@ test("readMcp: maps stdio, expands placeholders, injects PLUGIN_ROOT/PLUGIN_DATA
         PLUGIN_ROOT: pkgDir,
         PLUGIN_DATA: dataDir,
       },
-      enabled: true,
+      enabled: false,
     });
   } finally {
     cleanup(root);
@@ -597,7 +597,7 @@ test("readMcp: maps streamable-http to remote and skips sse/unknowns", () => {
       type: "remote",
       url: "https://api.example.com/mcp",
       headers: {},
-      enabled: true,
+      enabled: false,
     });
   } finally {
     cleanup(root);
@@ -695,7 +695,7 @@ test("planConfig: namespaces MCP collisions across distinct sources", () => {
     };
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "opencode-cache");
-    const plan = planConfig([a, b]);
+    const plan = planConfig([a, b], {}, {}, { mcp: ["alpha", "beta"] });
     assert.deepEqual(
       plan.mcp.map((m) => m.key).sort(),
       ["beta/shared", "shared"],
@@ -714,7 +714,7 @@ test("planConfig: same-source MCP mirrors are not duplicated", () => {
     };
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "node_modules");
-    const plan = planConfig([a, b]);
+    const plan = planConfig([a, b], {}, {}, { mcp: ["alpha", "beta"] });
     assert.deepEqual(plan.mcp.map((m) => m.key), ["shared"]);
   } finally {
     cleanup(root);
@@ -736,8 +736,10 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
 
-    // Enabled: readMcp runs — entry planned, side effect performed.
-    const on = planConfig([a], {}, { mcp: true });
+    // Enabled: readMcp runs — entry planned, side effect performed. Unlike
+    // the disabled probe below, this package is untrusted, so it needs an
+    // explicit consent entry to be admitted through the trust gate.
+    const on = planConfig([a], {}, { mcp: true }, { mcp: ["alpha"] });
     assert.deepEqual(on.mcp.map((m) => m.key), ["srv"]);
     assert.equal(existsSync(dataDir), true);
 
@@ -874,7 +876,10 @@ test("readMcp: __proto__ and constructor server keys are skipped loudly and leav
     // server, Object.prototype is untouched, and the container itself is
     // prototype-free (built via Object.create(null)).
     const cfg = {};
-    applyConfigPatch(cfg, planConfig([pkg]), { mcp: true, agents: false });
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { mcp: ["pkg"] }), {
+      mcp: true,
+      agents: false,
+    });
     assert.deepEqual(Object.keys(cfg.mcp), ["good"]);
     assert.equal(Object.getPrototypeOf(cfg.mcp), null);
   } finally {

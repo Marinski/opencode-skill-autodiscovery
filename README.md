@@ -191,14 +191,18 @@ registered skill's `SKILL.md` becomes prompt material in your sessions. The
 can copy the literal schema URL, so a conformant manifest proves nothing about
 who wrote it.
 
-### `mcp` and `agents` trust everything they find
+### `mcp` and `agents` register package content
 
-Both flags are single global switches: enabling one trusts **every** discovered
-package that ships the matching config, narrowed by `exclude` and refined by
-per-package `consent` (below).
+Both flags are global opt-in switches, narrowed by `exclude` and refined by
+per-package `consent` (below). Trust decides admission: `mcp: true` admits
+servers from trusted packages, and from untrusted packages only when the
+package is listed under `consent.mcp`.
 
-- `mcp: true` registers every conformant package's `mcp.json`; stdio entries
-  execute commands on your machine.
+- `mcp: true` admits MCP servers from packages that are trusted or listed in
+  `consent.mcp`. Every registered package-supplied server starts with
+  `enabled: false`: opencode will not spawn a package-declared binary or
+  connect to a package-chosen endpoint at startup on discovery alone.
+  Admittance is opt-in; the safe default is off.
 - `agents: true` registers package-supplied agents essentially verbatim within
   the schema: a package can set `mode: "primary"` (making itself a primary
   agent) and arbitrary `tools` booleans such as `"write": true`. Only
@@ -248,8 +252,8 @@ trusted by default:
 - `exclude` remains the deny side and wins: a package listed in both
   `exclude` and `consent` is never discovered.
 - Trusted packages need no consent entry.
-- The default — no `consent` option — grants nothing extra; behavior is
-  identical to today's.
+- The default — no `consent` option — grants nothing extra: untrusted
+  packages contribute no MCP servers until admitted by name.
 
 Consent is declarative (package names in `opencode.json`), so it works inside
 opencode's synchronous `config` hook — no interactive prompt required.

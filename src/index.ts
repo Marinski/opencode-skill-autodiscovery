@@ -58,8 +58,10 @@ export default (async (_input, options) => {
       const exclude = Array.isArray(options?.exclude)
         ? (options.exclude as string[])
         : [];
-      // Surface only: the options parse and default to no consent. The gating
-      // tasks consume this map; nothing here changes registration yet.
+      // Consent refines the mcp switch for untrusted packages: consent.mcp
+      // admits a package's servers by name when mcp:true is on. Agents
+      // consent is parsed and carried for the same gate; nothing here makes
+      // an untrusted package register without its switch on.
       const consent = parseConsent(options?.consent);
 
       const packages: PluginPackage[] = [];
@@ -80,6 +82,7 @@ export default (async (_input, options) => {
           agents: Object.keys(config.agent ?? {}),
         },
         { mcp: mcpEnabled, agents: agentsEnabled },
+        { mcp: consent.mcp },
       );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });

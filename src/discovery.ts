@@ -715,6 +715,9 @@ export function planConfig(
   // skipped entirely — no mcp.json parsing, no filesystem side effects.
   // Same for agents: when agents is false readAgents is never invoked.
   enabled: { mcp?: boolean; agents?: boolean } = {},
+  // Per-package consent for untrusted packages: a package discovered as a
+  // side effect contributes nothing to plan.mcp unless its name is listed.
+  consent: { mcp?: Iterable<string> } = {},
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
@@ -782,11 +785,24 @@ export function planConfig(
 
   const mcp: ConfigPatch["mcp"] = [];
   if (enabled.mcp !== false) {
+    const consentedMcp = new Set(consent.mcp ?? []);
     const usedMcp = new Set(taken.mcp ?? []);
     const mcpOwner = new Map<string, PackageSource | "user">();
     for (const name of taken.mcp ?? []) mcpOwner.set(name, "user");
     const seenMcpEntry = new Set<string>();
     for (const pkg of packages) {
+      // Trust gate: MCP servers are both powerful and opaque to opencode.
+      // Untrusted packages are present merely as side effects, so they never
+      // contribute servers unless the user consented to the package by name.
+      // Host-vouched installs (trusted: true) pass through unchanged.
+      if (!pkg.trusted && !consentedMcp.has(pkg.name)) {
+        if (pkg.mcpPath) {
+          log(
+            `skipping MCP server for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.mcp to admit its servers`,
+          );
+        }
+        continue;
+      }
       const entries: Array<{ key: string; entry: McpEntry }> = [];
       readMcp(pkg, entries);
       for (const { key, entry } of entries) {

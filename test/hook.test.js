@@ -84,7 +84,7 @@ test("config hook: discovers an Agent Plugins package in the project node_module
   assert.equal(cfg.mcp, undefined);
 });
 
-test("config hook: registers MCP only when the mcp option is enabled", async () => {
+test("config hook: registers MCP only when mcp is enabled and the package is consented", async () => {
   makePackage(join(envRoot, "node_modules", "dotest2"), "dotest2", ["s"], {
     $schema: MCP_SCHEMA_URL,
     mcpServers: {
@@ -93,20 +93,29 @@ test("config hook: registers MCP only when the mcp option is enabled", async () 
   });
   const off = await runHook({ scanNodeModules: true });
   assert.equal(off.mcp, undefined);
-  const on = await runHook({ scanNodeModules: true, mcp: true });
+  // mcp:true alone is not enough for an untrusted package: the trust gate
+  // admits it only when the package name is listed in consent.mcp.
+  const gated = await runHook({ scanNodeModules: true, mcp: true });
+  assert.equal(gated.mcp, undefined, "untrusted package skipped without consent");
+  const on = await runHook({
+    scanNodeModules: true,
+    mcp: true,
+    consent: { mcp: ["dotest2"] },
+  });
   assert.equal(on.mcp.srv.type, "remote");
   assert.equal(on.mcp.srv.url, "https://api.example.com/mcp");
 });
 
-test("config hook: consent option parses without changing behavior (surface only)", async () => {
+test("config hook: consent admits an untrusted package's MCP servers", async () => {
   makePackage(join(envRoot, "node_modules", "consenttest"), "consenttest", ["s"], {
     $schema: MCP_SCHEMA_URL,
     mcpServers: {
       srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
     },
   });
-  // Consent is surface only here: with a switch on, registration is unchanged
-  // from today; with the switch off, consent alone enables nothing.
+  // Consent gates MCP registration for untrusted packages: with the switch
+  // on and the package listed, servers register; with the switch off,
+  // consent alone enables nothing.
   const on = await runHook({
     scanNodeModules: true,
     mcp: true,
@@ -117,7 +126,7 @@ test("config hook: consent option parses without changing behavior (surface only
     on.skills.paths.some((p) => p.includes("consenttest")),
     "package still discovered with consent present",
   );
-  assert.equal(on.mcp.srv.type, "remote", "mcp:true still registers servers");
+  assert.equal(on.mcp.srv.type, "remote", "consented package's servers register");
   const off = await runHook({ consent: { mcp: ["consenttest"] } });
   assert.equal(off.mcp, undefined, "consent without the mcp switch enables nothing");
   assert.equal(off.agent, undefined, "consent without the agents switch enables nothing");
