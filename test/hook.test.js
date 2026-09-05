@@ -98,6 +98,31 @@ test("config hook: registers MCP only when the mcp option is enabled", async () 
   assert.equal(on.mcp.srv.url, "https://api.example.com/mcp");
 });
 
+test("config hook: consent option parses without changing behavior (surface only)", async () => {
+  makePackage(join(envRoot, "node_modules", "consenttest"), "consenttest", ["s"], {
+    $schema: MCP_SCHEMA_URL,
+    mcpServers: {
+      srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
+    },
+  });
+  // Consent is surface only here: with a switch on, registration is unchanged
+  // from today; with the switch off, consent alone enables nothing.
+  const on = await runHook({
+    scanNodeModules: true,
+    mcp: true,
+    agents: true,
+    consent: { mcp: ["consenttest"], agents: ["consenttest"] },
+  });
+  assert.ok(
+    on.skills.paths.some((p) => p.includes("consenttest")),
+    "package still discovered with consent present",
+  );
+  assert.equal(on.mcp.srv.type, "remote", "mcp:true still registers servers");
+  const off = await runHook({ consent: { mcp: ["consenttest"] } });
+  assert.equal(off.mcp, undefined, "consent without the mcp switch enables nothing");
+  assert.equal(off.agent, undefined, "consent without the agents switch enables nothing");
+});
+
 test("config hook: does not overwrite a user-defined command", async () => {
   makePackage(join(envRoot, "node_modules", "dotest3"), "dotest3", ["custom"]);
   const hooks = await plugin({}, { scanNodeModules: true });

@@ -150,6 +150,7 @@ Use the tuple form to configure options:
 | `exclude` | `[]` | Package names to skip during discovery, regardless of trust tier. Matches the conformant package's `plugin.json` name, or the directory basename when there is no manifest. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
+| `consent` | `{}` | Per-package consent map: `consent.mcp` / `consent.agents` list package names whose MCP servers / agents are wanted even when the package is discovered as untrusted. Refines the `mcp` / `agents` switches; `exclude` remains the deny side. |
 
 Both scan flags default to `false` for supply-chain reasons: a discovered
 skill's `SKILL.md` becomes prompt material in your sessions, so anything that
@@ -193,7 +194,8 @@ who wrote it.
 ### `mcp` and `agents` trust everything they find
 
 Both flags are single global switches: enabling one trusts **every** discovered
-package that ships the matching config. There is no per-package consent step.
+package that ships the matching config, narrowed by `exclude` and refined by
+per-package `consent` (below).
 
 - `mcp: true` registers every conformant package's `mcp.json`; stdio entries
   execute commands on your machine.
@@ -213,10 +215,44 @@ registered:
 }
 ```
 
-Residual risk, stated plainly: approving or rejecting an individual package's
-MCP servers or agents would require an interactive consent surface, which
-opencode's synchronous `config` hook cannot provide. The granularity available
-today is all-or-nothing per component type, narrowed by `exclude`.
+### Per-package consent (`consent`)
+
+Consent is the per-package allow side for packages discovered as **untrusted**
+(the project's `node_modules`, user-supplied `extraRoots`, manifest-less
+walks). List a package's name under `consent.mcp` to admit its MCP servers, or
+under `consent.agents` to admit its agents, even though the package is not
+trusted by default:
+
+```json
+{
+  "plugin": [
+    [
+      "opencode-skill-autodiscovery",
+      {
+        "scanNodeModules": true,
+        "mcp": true,
+        "agents": true,
+        "consent": {
+          "mcp": ["community-tools"],
+          "agents": ["community-tools"]
+        }
+      }
+    ]
+  ]
+}
+```
+
+- `consent` only refines the coarse switches: `mcp: true` / `agents: true`
+  stay the on-switch, and `consent.mcp` / `consent.agents` list which
+  untrusted packages are admitted when a switch is on.
+- `exclude` remains the deny side and wins: a package listed in both
+  `exclude` and `consent` is never discovered.
+- Trusted packages need no consent entry.
+- The default — no `consent` option — grants nothing extra; behavior is
+  identical to today's.
+
+Consent is declarative (package names in `opencode.json`), so it works inside
+opencode's synchronous `config` hook — no interactive prompt required.
 
 ### Identifier rules
 
