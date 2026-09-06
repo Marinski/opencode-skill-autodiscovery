@@ -716,8 +716,9 @@ export function planConfig(
   // Same for agents: when agents is false readAgents is never invoked.
   enabled: { mcp?: boolean; agents?: boolean } = {},
   // Per-package consent for untrusted packages: a package discovered as a
-  // side effect contributes nothing to plan.mcp unless its name is listed.
-  consent: { mcp?: Iterable<string> } = {},
+  // side effect contributes nothing to plan.mcp or plan.agents unless its
+  // name is listed in the matching consent list.
+  consent: { mcp?: Iterable<string>; agents?: Iterable<string> } = {},
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
@@ -829,12 +830,28 @@ export function planConfig(
 
   const agents: ConfigPatch["agents"] = [];
   if (enabled.agents !== false) {
+    const consentedAgents = new Set(consent.agents ?? []);
     const usedAgents = new Set(taken.agents ?? []);
     const agentOwner = new Map<string, PackageSource | "user">();
     for (const name of taken.agents ?? []) agentOwner.set(name, "user");
     const seenAgent = new Set<string>();
     for (const pkg of packages) {
-      for (const { name, agent } of readAgents(pkg)) {
+      // Trust gate: agents are prompt-and-behavior material that a package
+      // registers into opencode config slots. Untrusted packages are present
+      // merely as side effects, so they contribute agents only when the user
+      // consented to the package by name. Host-vouched installs (trusted:
+      // true) pass through. Note the readAgents call is hoisted so name
+      // validation logs behave identically for every admitted package.
+      const pkgAgents = readAgents(pkg);
+      if (!pkg.trusted && !consentedAgents.has(pkg.name)) {
+        if (pkgAgents.length > 0) {
+          log(
+            `skipping agents for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.agents to admit its agents`,
+          );
+        }
+        continue;
+      }
+      for (const { name, agent } of pkgAgents) {
         const dedupeKey = `${pkg.root}\u0000${name}`;
         if (seenAgent.has(dedupeKey)) continue;
         seenAgent.add(dedupeKey);

@@ -82,7 +82,7 @@ export default (async (_input, options) => {
           agents: Object.keys(config.agent ?? {}),
         },
         { mcp: mcpEnabled, agents: agentsEnabled },
-        { mcp: consent.mcp },
+        { mcp: consent.mcp, agents: consent.agents },
       );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });

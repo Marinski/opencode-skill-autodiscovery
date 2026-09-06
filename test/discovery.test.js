@@ -779,8 +779,9 @@ test("planConfig: skips readAgents entirely when the agents flag is false", () =
     );
     const a = readPackage(pkgDir, "node_modules");
 
-    // Enabled: readAgents runs — agent planned.
-    const on = planConfig([a], {}, { agents: true });
+    // Enabled: readAgents runs — agent planned, but admission needs the
+    // package's consent: alpha is an untrusted node_modules package.
+    const on = planConfig([a], {}, { agents: true }, { agents: ["alpha"] });
     assert.deepEqual(on.agents.map((x) => x.name), ["reviewer"]);
 
     // Disabled: readAgents must not be invoked at all — nothing planned.
@@ -1175,6 +1176,62 @@ test("readAgents: reads dev.opencode manifest agents and strips permission", () 
   }
 });
 
+test("readAgents: clamps package-supplied mode and tools to the conservative default", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: {
+              reviewer: {
+                description: "Reviews diffs",
+                prompt: "You review code",
+                mode: "primary",
+                tools: { bash: true, write: true },
+              },
+            },
+          },
+        },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) so the named drops can be asserted.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    // Declared capability is never inherited: mode: "primary" clamps to
+    // "subagent" and tools booleans are dropped entirely.
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "reviewer");
+    assert.deepEqual(agents[0].agent, {
+      description: "Reviews diffs",
+      prompt: "You review code",
+      mode: "subagent",
+    });
+    assert.equal(logs.length, 2, "mode drop + tools drop logged");
+    for (const line of logs) {
+      assert.match(line, /agent "reviewer"/);
+      assert.match(line, /package "pkg"/);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readAgents: reads dev.opencode/agents/<name>.json extension directory", () => {
   const root = makeTemp();
   try {
@@ -1438,7 +1495,10 @@ test("readAgents: __proto__ and constructor manifest agent keys are skipped loud
     // entry, Object.prototype is untouched, and the container itself is
     // prototype-free (built via Object.create(null)).
     const cfg = {};
-    applyConfigPatch(cfg, planConfig([pkg]), { mcp: false, agents: true });
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { agents: ["pkg"] }), {
+      mcp: false,
+      agents: true,
+    });
     assert.deepEqual(Object.keys(cfg.agent), ["good"]);
     assert.equal(Object.getPrototypeOf(cfg.agent), null);
   } finally {
@@ -1584,7 +1644,9 @@ test("planConfig: namespaces agent collisions across distinct sources", () => {
     );
     const a = readPackage(aDir, "node_modules");
     const b = readPackage(bDir, "opencode-cache");
-    const plan = planConfig([a, b]);
+    // Test fixtures build packages untrusted by default (the collectors mark
+    // sources trusted in production), so both need consent to be admitted.
+    const plan = planConfig([a, b], {}, {}, { agents: ["alpha", "beta"] });
     assert.deepEqual(
       plan.agents.map((x) => x.name).sort(),
       ["beta-reviewer", "reviewer"],
@@ -1610,7 +1672,9 @@ test("planConfig: same-source agent mirrors are not duplicated", () => {
     writeFileSync(join(bDir, "plugin.json"), JSON.stringify(manifest("beta")));
     const a = readPackage(aDir, "node_modules");
     const b = readPackage(bDir, "node_modules");
-    const plan = planConfig([a, b]);
+    // Both same-source mirrors are untrusted: each needs consent for its
+    // agents to be admitted.
+    const plan = planConfig([a, b], {}, {}, { agents: ["alpha", "beta"] });
     assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
   } finally {
     cleanup(root);
@@ -1638,8 +1702,10 @@ test("planConfig: collapses the same conformant package across sources", () => {
     build(nmDir);
     const cache = readPackage(cacheDir, "opencode-cache");
     const nm = readPackage(nmDir, "node_modules");
-    const plan = planConfig([cache, nm]);
-    // Same package name across sources: one agent, one skill path, one command.
+    // Same package name across sources: one agent, one skill path, one
+    // command. The surviving deduplicated copy is first (the cache one), and
+    // test fixtures are untrusted, so consent admits it by name.
+    const plan = planConfig([cache, nm], {}, {}, { agents: ["dotest"] });
     assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
     assert.equal(plan.skillPaths.length, 1);
     assert.deepEqual(plan.commands.map((c) => c.name), ["s"]);

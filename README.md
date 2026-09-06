@@ -87,9 +87,11 @@ Discovered agents are registered as `config.agent.<name>` with the same rules
 as commands: user-defined agents are never overwritten, same-source mirrors are
 collapsed, and cross-source collisions become `<package>-<agent>`.
 
-**Trust note:** a package-supplied `permission` block is always dropped — agent
-permissions are too powerful to inherit from a package by default. If you need
-one, define the agent yourself in `opencode.json` (which always wins).
+**Trust note:** package-supplied capability is clamped to the conservative
+default: `permission` blocks and `tools` grants are always dropped, and any
+declared `mode` other than `subagent` clamps to `subagent`. Each drop is logged
+naming the package and the agent. If you need more, define the agent yourself
+in `opencode.json` (which always wins).
 
 ### Slash commands
 
@@ -194,19 +196,23 @@ who wrote it.
 ### `mcp` and `agents` register package content
 
 Both flags are global opt-in switches, narrowed by `exclude` and refined by
-per-package `consent` (below). Trust decides admission: `mcp: true` admits
-servers from trusted packages, and from untrusted packages only when the
-package is listed under `consent.mcp`.
+per-package `consent` (below). Trust decides admission: `mcp: true` /
+`agents: true` admit servers or agents from trusted packages, and from
+untrusted packages only when the package is listed under `consent.mcp` /
+`consent.agents`.
 
 - `mcp: true` admits MCP servers from packages that are trusted or listed in
   `consent.mcp`. Every registered package-supplied server starts with
   `enabled: false`: opencode will not spawn a package-declared binary or
   connect to a package-chosen endpoint at startup on discovery alone.
   Admittance is opt-in; the safe default is off.
-- `agents: true` registers package-supplied agents essentially verbatim within
-  the schema: a package can set `mode: "primary"` (making itself a primary
-  agent) and arbitrary `tools` booleans such as `"write": true`. Only
-  `permission` blocks are dropped.
+- `agents: true` admits agents from packages that are trusted or listed in
+  `consent.agents`, then clamps each to the conservative default: a declared
+  `mode` other than `subagent` is dropped (a package cannot make itself a
+  primary agent), `tools` booleans such as `"write": true` are never
+  inherited, and `permission` blocks are dropped — each drop is logged naming
+  the package and the agent. An agent without an explicit `mode` still falls
+  through to opencode's `all` default.
 
 Pair these flags with `exclude` to carve out packages you do not want
 registered:
@@ -253,7 +259,7 @@ trusted by default:
   `exclude` and `consent` is never discovered.
 - Trusted packages need no consent entry.
 - The default — no `consent` option — grants nothing extra: untrusted
-  packages contribute no MCP servers until admitted by name.
+  packages contribute no MCP servers or agents until admitted by name.
 
 Consent is declarative (package names in `opencode.json`), so it works inside
 opencode's synchronous `config` hook — no interactive prompt required.

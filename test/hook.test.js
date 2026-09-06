@@ -143,7 +143,7 @@ test("config hook: does not overwrite a user-defined command", async () => {
   assert.equal(cfg.command.custom.template, "user template");
 });
 
-test("config hook: registers agents only when the agents option is enabled", async () => {
+test("config hook: registers agents only when the agents option is enabled and the package is consented", async () => {
   const pkgDir = join(envRoot, "node_modules", "dotest4");
   mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
   writeFileSync(
@@ -170,8 +170,18 @@ test("config hook: registers agents only when the agents option is enabled", asy
   );
   const off = await runHook({ scanNodeModules: true });
   assert.equal(off.agent, undefined);
-  const on = await runHook({ scanNodeModules: true, agents: true });
-  assert.ok(on.agent.reviewer, "agent registered when agents:true");
+  const gated = await runHook({ scanNodeModules: true, agents: true });
+  assert.equal(
+    gated.agent,
+    undefined,
+    "untrusted package skipped without consent.agents",
+  );
+  const on = await runHook({
+    scanNodeModules: true,
+    agents: true,
+    consent: { agents: ["dotest4"] },
+  });
+  assert.ok(on.agent.reviewer, "agent registered when agents:true and consented");
   assert.equal(on.agent.reviewer.description, "Reviews diffs");
   assert.equal(on.agent.reviewer.permission, undefined, "permission stripped");
 });
