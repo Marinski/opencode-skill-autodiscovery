@@ -50,6 +50,38 @@ function collectHeaders(value: unknown): Record<string, string> {
   return headers;
 }
 
+// opencode stores config.mcp in plaintext, so credential-looking inputs get a
+// loud warning (never a silent strip - the server needs the real value; the
+// controls are warn + gate + consent). Header names match the well-known
+// credential set case-insensitively; header/env values that visibly contain a
+// bearer/secret pattern qualify; and an http(s) url with an userinfo@
+// component counts too.
+const CREDENTIAL_HEADER_NAME =
+  /\b(authorization|api[-_]?key|token|bearer|apikey|cookie)\b/i;
+const CREDENTIAL_VALUE = /(bearer|secret)/i;
+const USERINFO_URL = /^[a-z][a-z0-9+.-]*:\/\/[^/?#\s]*@/i;
+
+// Classifies one name/value pair (or a bare url) as credential-like and
+// returns a short reason for the warning, or null when it looks harmless.
+function credentialHit(
+  kind: "header" | "env" | "url",
+  name: string,
+  value = "",
+): string | null {
+  if (kind === "url") {
+    return USERINFO_URL.test(name) ? "carries an userinfo@ component" : null;
+  }
+  if (kind === "header" && CREDENTIAL_HEADER_NAME.test(name)) {
+    return "declares an Authorization-style header";
+  }
+  if (CREDENTIAL_VALUE.test(value)) {
+    return kind === "header"
+      ? "declares a credential-looking header value"
+      : "declares a credential-looking env value";
+  }
+  return null;
+}
+
 function hasUnknownKeys(
   server: Record<string, unknown>,
   allowed: Set<string>,
@@ -163,6 +195,12 @@ export function readMcp(
           }
         }
       }
+      for (const [k, v] of Object.entries(environment)) {
+        const hit = credentialHit("env", k, v);
+        if (hit) {
+          log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+        }
+      }
       environment.PLUGIN_ROOT = pkg.root;
       environment.PLUGIN_DATA = dataDir;
       if (server.cwd !== undefined) {
@@ -196,12 +234,23 @@ export function readMcp(
       if (!requireHttpsUrl(pkg.name, name, server.url)) {
         continue;
       }
+      const urlHit = credentialHit("url", server.url);
+      if (urlHit) {
+        log(`MCP server "${pkg.name}/${name}" ${urlHit}; it will be stored in opencode's config in plaintext`);
+      }
+      const headers = collectHeaders(server.headers);
+      for (const [k, v] of Object.entries(headers)) {
+        const hit = credentialHit("header", k, v);
+        if (hit) {
+          log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+        }
+      }
       out.push({
         key: name,
         entry: {
           type: "remote",
           url: server.url,
-          headers: collectHeaders(server.headers),
+          headers,
           enabled: false,
         },
       });

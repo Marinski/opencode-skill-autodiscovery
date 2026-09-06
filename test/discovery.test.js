@@ -882,6 +882,131 @@ test("readMcp: rejects an http:// streamable-http url (even with headers) and le
   }
 });
 
+test("readMcp: warns (does not strip) when a remote entry declares an Authorization-style header", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (b): an https url plus an Authorization header is mirrored
+    // as-is but warned - opencode stores config.mcp in plaintext.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // The entry still registers with the header intact (warn, don't strip)...
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, "authed");
+    assert.deepEqual(out[0].entry.headers, { Authorization: "Bearer sekrit" });
+    // ...and exactly one loud line names package, server, and the risk.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /MCP server "pkg\/authed"/);
+    assert.match(logs[0], /Authorization-style header/);
+    assert.match(logs[0], /stored in opencode's config in plaintext/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: warns when a remote url carries an userinfo@ component", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (c): user:pass@ in the url is a credential and gets the same
+    // warn-but-keep treatment.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        userinfo: {
+          type: "streamable-http",
+          url: "https://user:pass@api.example.com/mcp",
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // The entry still registers with the url intact (warn, don't strip)...
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, "userinfo");
+    assert.equal(out[0].entry.url, "https://user:pass@api.example.com/mcp");
+    // ...and exactly one loud line names package, server, and the risk.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /MCP server "pkg\/userinfo"/);
+    assert.match(logs[0], /userinfo@/);
+    assert.match(logs[0], /stored in opencode's config in plaintext/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: credential-free entries produce no warning", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (e): benign headers, env values, and urls must not warn.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        remote: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Accept: "application/json", "X-Trace-Id": "abc123" },
+        },
+        local: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "server"],
+          env: { MODE: "production", REGION: "eu" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // Both entries register and nothing is warned about.
+    assert.equal(out.length, 2);
+    assert.deepEqual(out.map((e) => e.key).sort(), ["local", "remote"]);
+    assert.equal(logs.length, 0);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readMcp: __proto__ and constructor server keys are skipped loudly and leave config.mcp clean", () => {
   const root = makeTemp();
   try {
