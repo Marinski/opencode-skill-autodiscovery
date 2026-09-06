@@ -1087,6 +1087,152 @@ test("readMcp: credential-free entries produce no warning", () => {
   }
 });
 
+test("reject-warn-consent matrix runs together end to end: http rejected, credentials warn per package/server, untrusted gated on consent, clean entries silent", () => {
+  const root = makeTemp();
+  try {
+    // One fixture package carrying every matrix cell at once, so the cells
+    // are exercised together the way a real discovered package would be:
+    //   (a) insecure    - http:// url with Authorization -> rejected, never lands
+    //   (b) authed      - https + Authorization header   -> warns, registers
+    //   (c) userinfo    - https://user:pass@ url         -> warns, registers
+    //   (e) cleanremote - https, benign header           -> silent, registers
+    //   (e) localsecret - stdio env with credential value -> warns, registers
+    //   (e) localclean  - stdio env without credentials   -> silent, registers
+    const pkgDir = makePackage(root, "matrixpkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        insecure: {
+          type: "streamable-http",
+          url: "http://api.example.com/mcp",
+          headers: { Authorization: "Bearer secret" },
+        },
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+        userinfo: {
+          type: "streamable-http",
+          url: "https://user:pass@api.example.com/mcp",
+        },
+        cleanremote: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Accept: "application/json" },
+        },
+        localsecret: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "srv"],
+          env: { API_TOKEN: "s3cr3t-bearer-value" },
+        },
+        localclean: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "srv"],
+          env: { MODE: "production" },
+        },
+      },
+    });
+    const untrusted = readPackage(pkgDir, "node_modules");
+    const trusted = readPackage(pkgDir, "claude", true);
+    const dataDir = join(stateDir, "opencode", "plugin-data", "matrixpkg");
+
+    // Frames planConfig with console.error captured so the rejections and
+    // plaintext warnings are observed exactly as the user would see them -
+    // during planning, before any entry lands in config.
+    function planned(pkgs, consent) {
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      let plan;
+      try {
+        plan = planConfig(pkgs, {}, { mcp: true }, consent);
+      } finally {
+        console.error = origError;
+      }
+      return { plan, logs };
+    }
+
+    // (d) without consent: every server of the untrusted package is refused.
+    // Each credential-bearing entry gets its own named per-server line, the
+    // http:// entry gets the https rejection, and nothing is planned.
+    rmSync(dataDir, { recursive: true, force: true });
+    const off = planned([untrusted], {});
+    assert.deepEqual(off.plan.mcp, []);
+    assert.deepEqual(
+      off.logs.map((l) => l.replace("[opencode-skill-autodiscovery] ", "")).sort(),
+      [
+        'skipping MCP server "matrixpkg/authed" (node_modules): declares an Authorization-style header; add it to consent.mcp to admit its servers',
+        'skipping MCP server "matrixpkg/insecure": remote servers must use https',
+        'skipping MCP server "matrixpkg/localsecret" (node_modules): declares a credential-looking env value; add it to consent.mcp to admit its servers',
+        'skipping MCP server "matrixpkg/userinfo" (node_modules): carries an userinfo@ component; add it to consent.mcp to admit its servers',
+      ],
+    );
+    assert.equal(existsSync(dataDir), false, "planning writes no package data dir");
+
+    // (d) with consent: the untrusted package's servers are admitted. Every
+    // credential-bearing entry warns at plan time - naming package and server
+    // - before the entries land in config. The http:// entry still never
+    // transits, and the credential-free entries stay silent.
+    rmSync(dataDir, { recursive: true, force: true });
+    const on = planned([untrusted], { mcp: ["matrixpkg"] });
+    assert.deepEqual(on.plan.mcp.map((m) => m.key).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    const onWarnings = on.logs.filter((l) => /will be stored in opencode's config in plaintext/.test(l));
+    assert.deepEqual(
+      onWarnings.map((l) => l.replace("[opencode-skill-autodiscovery] ", "")).sort(),
+      [
+        `MCP server "matrixpkg/authed" declares an Authorization-style header; it will be stored in opencode's config in plaintext`,
+        `MCP server "matrixpkg/localsecret" declares a credential-looking env value; it will be stored in opencode's config in plaintext`,
+        `MCP server "matrixpkg/userinfo" carries an userinfo@ component; it will be stored in opencode's config in plaintext`,
+      ],
+    );
+    // (a) the http:// host is rejected with a named warning in the same run.
+    assert.equal(on.logs.some((l) => /skipping MCP server "matrixpkg\/insecure": remote servers must use https/.test(l)), true);
+    // (e) no warning names a credential-free server.
+    assert.equal(on.logs.some((l) => /cleanremote|localclean/.test(l)), false);
+    assert.equal(existsSync(dataDir), false, "planning still writes no package data dir");
+
+    const cfg = {};
+    applyConfigPatch(cfg, on.plan, { mcp: true, agents: false });
+    assert.deepEqual(Object.keys(cfg.mcp).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    assert.equal(cfg.mcp.insecure, undefined, "no package-declared entry can transit http://");
+    assert.deepEqual(cfg.mcp.authed.headers, { Authorization: "Bearer sekrit" });
+    assert.equal(cfg.mcp.userinfo.url, "https://user:pass@api.example.com/mcp");
+    // Applying the opted-in stdio servers is the only point a data dir appears.
+    assert.equal(existsSync(dataDir), true);
+
+    // Trusted packages need no consent: identical admission and warnings.
+    rmSync(dataDir, { recursive: true, force: true });
+    const tr = planned([trusted], {});
+    assert.deepEqual(tr.plan.mcp.map((m) => m.key).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    const trWarnings = tr.logs.filter((l) => /will be stored in opencode's config in plaintext/.test(l));
+    assert.equal(trWarnings.length, 3);
+    assert.equal(tr.logs.some((l) => /skipping MCP server "matrixpkg\/insecure": remote servers must use https/.test(l)), true);
+    assert.equal(tr.logs.some((l) => /cleanremote|localclean/.test(l)), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readMcp: __proto__ and constructor server keys are skipped loudly and leave config.mcp clean", () => {
   const root = makeTemp();
   try {
