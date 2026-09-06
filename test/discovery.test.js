@@ -834,6 +834,54 @@ test("readMcp: rejects non-http(s) urls for remote transports", () => {
   }
 });
 
+test("readMcp: rejects an http:// streamable-http url (even with headers) and leaves config.mcp clean", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (a): a streamable-http entry carrying an Authorization header
+    // and an http:// url must be rejected by the shared https gate - the
+    // header would otherwise ship in cleartext.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        insecure: {
+          type: "streamable-http",
+          url: "http://api.example.com/mcp",
+          headers: { Authorization: "Bearer secret" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) around the readMcp run.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // No mirrored entry for the http:// server...
+    assert.equal(out.length, 0);
+    // ...and exactly one loud line naming package, server, and reason.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /skipping MCP server "pkg\/insecure"/);
+    assert.match(logs[0], /remote servers must use https/);
+    // config.mcp stays empty after patching.
+    const cfg = {};
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { mcp: ["pkg"] }), {
+      mcp: true,
+      agents: false,
+    });
+    assert.equal(cfg.mcp, undefined);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readMcp: __proto__ and constructor server keys are skipped loudly and leave config.mcp clean", () => {
   const root = makeTemp();
   try {

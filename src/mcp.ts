@@ -21,7 +21,7 @@ export type McpEntry =
 
 const STDIO_KEYS = new Set(["type", "command", "args", "env", "cwd"]);
 const HTTP_KEYS = new Set(["type", "url", "headers"]);
-const HTTP_URL = /^https?:\/\//;
+const HTTPS_URL = /^https:\/\//;
 
 function opencodeStateRoot(): string {
   const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
@@ -55,6 +55,23 @@ function hasUnknownKeys(
   allowed: Set<string>,
 ): boolean {
   return Object.keys(server).some((k) => !allowed.has(k));
+}
+
+// Remote transports must connect over TLS: a plain http:// url would ship
+// the server's headers (e.g. an Authorization token) in cleartext. Every
+// remote branch (streamable-http, sse) shares this single https-only gate.
+function requireHttpsUrl(
+  pkgName: string,
+  serverName: string,
+  url: string,
+): boolean {
+  if (!HTTPS_URL.test(url)) {
+    log(
+      `skipping MCP server "${pkgName}/${serverName}": remote servers must use https`,
+    );
+    return false;
+  }
+  return true;
 }
 
 // Maps the portable mcp.json shape onto opencode's native config.mcp. Per the
@@ -176,8 +193,7 @@ export function readMcp(
         log(`skipping MCP server "${pkg.name}/${name}": streamable-http requires a string url`);
         continue;
       }
-      if (!HTTP_URL.test(server.url)) {
-        log(`skipping MCP server "${pkg.name}/${name}": url must be an absolute http(s) URL`);
+      if (!requireHttpsUrl(pkg.name, name, server.url)) {
         continue;
       }
       out.push({
@@ -194,8 +210,11 @@ export function readMcp(
         log(`skipping MCP server "${pkg.name}/${name}": unknown fields in sse entry`);
         continue;
       }
-      if (typeof server.url !== "string" || !HTTP_URL.test(server.url)) {
-        log(`skipping MCP server "${pkg.name}/${name}": sse requires an absolute http(s) url`);
+      if (typeof server.url !== "string") {
+        log(`skipping MCP server "${pkg.name}/${name}": sse requires an absolute https url`);
+        continue;
+      }
+      if (!requireHttpsUrl(pkg.name, name, server.url)) {
         continue;
       }
       log(`skipping MCP server "${pkg.name}/${name}": opencode does not support the sse transport`);
