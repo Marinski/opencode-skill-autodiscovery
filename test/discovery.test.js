@@ -999,6 +999,52 @@ test("readMcp: warns when a remote url carries an userinfo@ component", () => {
   }
 });
 
+test("planConfig: credential-bearing MCP entries from untrusted packages are skipped by default with a named line and admitted by consent", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (d): a streamable-http entry carrying an Authorization header
+    // from an untrusted package is refused by the trust gate with a named
+    // line, and admitted only when the package is consented.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Without consent the entry is refused with exactly one named line
+    // naming the server and the credential reason.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let off;
+    try {
+      off = planConfig([pkg], {}, { mcp: true });
+    } finally {
+      console.error = origError;
+    }
+    assert.equal(off.mcp.length, 0);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /skipping MCP server "pkg\/authed"/);
+    assert.match(logs[0], /Authorization-style header/);
+    assert.match(logs[0], /consent\.mcp/);
+
+    // With the package in consent.mcp the same entry registers. Its
+    // plaintext warning fires on the admitted run (warn is on by default).
+    const on = planConfig([pkg], {}, { mcp: true }, { mcp: ["pkg"] });
+    assert.deepEqual(on.mcp.map((m) => m.key), ["authed"]);
+    assert.deepEqual(on.mcp[0].entry.headers, { Authorization: "Bearer sekrit" });
+    assert.equal(on.mcp[0].trusted, false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readMcp: credential-free entries produce no warning", () => {
   const root = makeTemp();
   try {

@@ -13,7 +13,7 @@ import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
 import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
 import type { AgentConfig } from "./agents.js";
-import type { McpEntry } from "./mcp.js";
+import type { McpEntry, McpPlanEntry } from "./mcp.js";
 
 export { readAgents } from "./agents.js";
 export type { AgentConfig } from "./agents.js";
@@ -808,14 +808,30 @@ export function planConfig(
       // contribute servers unless the user consented to the package by name.
       // Host-vouched installs (trusted: true) pass through unchanged.
       if (!pkg.trusted && !consentedMcp.has(pkg.name)) {
+        // Slice the credential signal out of the untrusted package's mcp.json
+        // so entries carrying headers/env/url credentials get a per-entry
+        // refusal line. readMcp runs with warnings off: a refused credential
+        // must never be told it "will be stored in opencode's config".
         if (pkg.mcpPath) {
-          log(
-            `skipping MCP server for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.mcp to admit its servers`,
-          );
+          const entries: McpPlanEntry[] = [];
+          readMcp(pkg, entries, { warn: false });
+          let named = 0;
+          for (const { key, credentialReason } of entries) {
+            if (!credentialReason) continue;
+            named++;
+            log(
+              `skipping MCP server "${pkg.name}/${key}" (${pkg.source}): ${credentialReason}; add it to consent.mcp to admit its servers`,
+            );
+          }
+          if (named === 0) {
+            log(
+              `skipping MCP server for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.mcp to admit its servers`,
+            );
+          }
         }
         continue;
       }
-      const entries: Array<{ key: string; entry: McpEntry }> = [];
+      const entries: McpPlanEntry[] = [];
       readMcp(pkg, entries);
       for (const { key, entry } of entries) {
         const dedupeKey = `${pkg.root}\u0000${key}`;

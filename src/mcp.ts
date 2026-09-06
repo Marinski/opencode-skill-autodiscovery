@@ -106,12 +106,25 @@ function requireHttpsUrl(
   return true;
 }
 
+// One planned server: the config entry opencode merges, plus the step-2
+// credential signal (first credential hit) that the trust gate names when it
+// refuses the entry from an untrusted package.
+export type McpPlanEntry = {
+  key: string;
+  entry: McpEntry;
+  credentialReason?: string;
+};
+
 // Maps the portable mcp.json shape onto opencode's native config.mcp. Per the
 // Agent Plugins spec, failures are per-entry (and per-package for an invalid
 // mcp.json): a bad server never blocks other servers or the package's skills.
+// opts.warn === false silences the credential plaintext warnings so the trust
+// gate can read a package whose entries are about to be refused - a refused
+// credential must never be told it "will be stored in opencode's config".
 export function readMcp(
   pkg: PluginPackage,
-  out: Array<{ key: string; entry: McpEntry }>,
+  out: McpPlanEntry[],
+  opts: { warn?: boolean } = {},
 ): void {
   if (!pkg.mcpPath) return;
   let raw: string;
@@ -195,10 +208,14 @@ export function readMcp(
           }
         }
       }
+      let credentialReason: string | undefined;
       for (const [k, v] of Object.entries(environment)) {
         const hit = credentialHit("env", k, v);
         if (hit) {
-          log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+          credentialReason ??= hit;
+          if (opts.warn !== false) {
+            log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+          }
         }
       }
       environment.PLUGIN_ROOT = pkg.root;
@@ -216,6 +233,7 @@ export function readMcp(
       out.push({
         key: name,
         entry: { type: "local", command: [command, ...args], environment, enabled: false },
+        credentialReason,
       });
     } else if (server.type === "streamable-http") {
       if (hasUnknownKeys(server, HTTP_KEYS)) {
@@ -230,14 +248,18 @@ export function readMcp(
         continue;
       }
       const urlHit = credentialHit("url", server.url);
-      if (urlHit) {
+      let credentialReason = urlHit ?? undefined;
+      if (urlHit && opts.warn !== false) {
         log(`MCP server "${pkg.name}/${name}" ${urlHit}; it will be stored in opencode's config in plaintext`);
       }
       const headers = collectHeaders(server.headers);
       for (const [k, v] of Object.entries(headers)) {
         const hit = credentialHit("header", k, v);
         if (hit) {
-          log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+          credentialReason ??= hit;
+          if (opts.warn !== false) {
+            log(`MCP server "${pkg.name}/${name}" ${hit}; it will be stored in opencode's config in plaintext`);
+          }
         }
       }
       out.push({
@@ -248,6 +270,7 @@ export function readMcp(
           headers,
           enabled: false,
         },
+        credentialReason,
       });
     } else if (server.type === "sse") {
       if (hasUnknownKeys(server, HTTP_KEYS)) {
