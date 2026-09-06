@@ -186,6 +186,57 @@ test("config hook: registers agents only when the agents option is enabled and t
   assert.equal(on.agent.reviewer.permission, undefined, "permission stripped");
 });
 
+test("config hook: agent tools from a consented package are dropped with a merge-time warning naming package and agent", async () => {
+  const pkgDir = join(envRoot, "node_modules", "toolgrant");
+  mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "s", "SKILL.md"),
+    "---\nname: s\n---\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "toolgrant",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            reviewer: {
+              description: "Reviews diffs",
+              prompt: "You review code",
+              tools: { bash: true, write: true },
+            },
+          },
+        },
+      },
+    }),
+  );
+
+  const logs = [];
+  const origError = console.error;
+  console.error = (...args) => logs.push(args.map(String).join(" "));
+  let cfg;
+  try {
+    cfg = await runHook({
+      scanNodeModules: true,
+      agents: true,
+      consent: { agents: ["toolgrant"] },
+    });
+  } finally {
+    console.error = origError;
+  }
+
+  // The agent is admitted, minus its declared tools grant...
+  assert.ok(cfg.agent.reviewer, "consented agent registers");
+  assert.equal("tools" in cfg.agent.reviewer, false, "tools grant never reaches config");
+  // ...and the drop warning appears in the hook's merge output, naming the
+  // agent and the package that supplied it.
+  const drop = logs.find((line) => line.includes("dropping tools"));
+  assert.ok(drop, "tools-drop warning appears in the merge summary");
+  assert.match(drop, /agent "reviewer"/);
+  assert.match(drop, /package "toolgrant"/);
+});
+
 test("config hook: project node_modules is not scanned unless scanNodeModules is true", async () => {
   // Conformant package carrying every component type the plugin can
   // register from node_modules: a skill (which would also become a slash
@@ -283,6 +334,55 @@ test("config hook: opencode plugin cache is not scanned unless scanCache is true
     true,
     "slash command restored with scanCache:true",
   );
+});
+
+test("config hook: trusted opencode-cache package registers MCP server and agent without consent", async () => {
+  // opencode installs npm plugins into its own cache, so cache packages are
+  // host-vouched (trusted). The trust gate must not require consent for them:
+  // mcp:true / agents:true alone admit their servers and agents.
+  const pkgDir = join(
+    envRoot,
+    ".cache",
+    "opencode",
+    "packages",
+    "trustedcache@1.0.0",
+    "node_modules",
+    "trustedcache",
+  );
+  mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "s", "SKILL.md"),
+    "---\nname: s\ndescription: s\n---\n# s\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "trustedcache",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            reviewer: { description: "Reviews diffs", prompt: "You review code" },
+          },
+        },
+      },
+    }),
+  );
+  writeFileSync(
+    join(pkgDir, "mcp.json"),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
+      },
+    }),
+  );
+
+  const on = await runHook({ scanCache: true, mcp: true, agents: true });
+  assert.ok(on.agent.reviewer, "trusted cache package's agent registers without consent");
+  assert.equal(on.agent.reviewer.description, "Reviews diffs");
+  assert.equal(on.mcp.srv.type, "remote", "trusted cache package's MCP server registers without consent");
+  assert.equal(on.mcp.srv.enabled, false, "package-supplied MCP entry still defaults to enabled:false");
 });
 
 test("config hook: no plugin-data directory without flags or with an unparseable mcp.json", async () => {
