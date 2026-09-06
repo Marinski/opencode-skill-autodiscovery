@@ -62,6 +62,35 @@ and both variables are injected into each stdio server's environment
 per-entry, never fatally. `sse` servers and stdio `cwd` (which opencode cannot
 represent) are dropped with a log line.
 
+### MCP credentials
+
+Package-declared `mcp.json` servers are mirrored **verbatim** into your
+opencode config: `headers`, `env` values, and server `url`s are copied exactly
+as written (modulo `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` expansion) into
+`config.mcp.<server>`. opencode stores `config.mcp` in plaintext, so any
+credential in those fields — an `Authorization` header, a token in `env`, an
+`userinfo@` URL — is plaintext-at-rest and may appear in host config backups,
+logs, or terminal output. Treat a server's headers/env/URL as a static
+snapshot: once mirrored, the value has no rotation or revocation linkage back
+to the package — updating the package does not rotate a copied token.
+
+Guidance:
+
+- **Use https-only remotes.** `streamable-http` servers must already be
+  `https://` to register (a plain `http://` URL would ship any `headers` in
+  cleartext), and that is the transport you want when a server carries
+  credentials.
+- **Audit `config.mcp`** after discovery to confirm which servers and
+  credential fields entered your config, and remove anything you did not
+  intend to persist.
+- **Use `consent` / `exclude`** to control admission: servers from untrusted
+  packages are skipped until the package is listed under `consent.mcp`, and
+  `exclude` drops a package entirely.
+- The planning-time `mkdir` for a package stdio server's `PLUGIN_DATA`
+  directory is deferred: the directory is created only when the server is
+  actually applied to the config, never at plan time — so a
+  discovered-but-unapplied server leaves no filesystem trace.
+
 ### Agents (opt-in)
 
 Agent Plugins 1.0.0 has no portable "agents" component type (only skills and
