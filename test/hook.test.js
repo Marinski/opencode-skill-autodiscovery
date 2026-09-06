@@ -386,9 +386,10 @@ test("config hook: trusted opencode-cache package registers MCP server and agent
 });
 
 test("config hook: no plugin-data directory without flags or with an unparseable mcp.json", async () => {
-  // FS snapshot: readMcp's stdio branch is the only code path that creates
-  // {state}/opencode/plugin-data/{pkg}, and it must do so only when the mcp
-  // flag is enabled AND mcp.json parsed successfully.
+  // FS snapshot: applyConfigPatch's mcp branch is the only code path that
+  // creates {state}/opencode/plugin-data/{pkg} (never at plan time), and it
+  // runs only when the mcp flag is enabled AND a stdio server was actually
+  // planned from a parsed mcp.json.
   const pluginDataRoot = join(envRoot, ".local", "state", "opencode", "plugin-data");
 
   // Package carrying every component type (skill, agent, valid stdio

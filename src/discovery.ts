@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -930,6 +931,16 @@ export function applyConfigPatch(
     for (const { key, entry } of plan.mcp) {
       if (config.mcp[key]) continue;
       config.mcp[key] = entry;
+      // A package stdio server runs with PLUGIN_DATA pointing at its data
+      // dir. The dir is created only here, when the server is actually
+      // applied -- never at plan time, so planning leaves no trace on disk.
+      if (entry.type === "local" && entry.environment?.PLUGIN_DATA) {
+        try {
+          mkdirSync(entry.environment.PLUGIN_DATA, { recursive: true });
+        } catch {
+          // Non-fatal: the subprocess env still points at the (uncreated) dir.
+        }
+      }
     }
   }
 

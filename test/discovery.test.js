@@ -725,8 +725,10 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
   const root = makeTemp();
   try {
     // stdio entries are the strongest probe for invocation: readMcp's stdio
-    // branch mkdirs the package's plugin-data dir as a side effect, and ESM
-    // bindings can't be monkey-patched with a literal spy.
+    // branch is the path that plans a server, ESM bindings can't be
+    // monkey-patched with a literal spy, and planning never writes the
+    // package's plugin-data dir (only applying an opted-in server does), so
+    // the planned entries themselves are the invocation probe.
     const mcp = {
       $schema: MCP_SCHEMA_URL,
       mcpServers: {
@@ -736,12 +738,12 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
 
-    // Enabled: readMcp runs — entry planned, side effect performed. Unlike
-    // the disabled probe below, this package is untrusted, so it needs an
-    // explicit consent entry to be admitted through the trust gate.
+    // Enabled: readMcp runs — entry planned. Unlike the disabled probe
+    // below, this package is untrusted, so it needs an explicit consent
+    // entry to be admitted through the trust gate.
     const on = planConfig([a], {}, { mcp: true }, { mcp: ["alpha"] });
     assert.deepEqual(on.mcp.map((m) => m.key), ["srv"]);
-    assert.equal(existsSync(dataDir), true);
+    assert.equal(existsSync(dataDir), false);
 
     // Disabled: readMcp must not be invoked at all — nothing planned, no
     // filesystem side effects (dir removed first so absence proves it).
@@ -749,6 +751,38 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
     const off = planConfig([a], {}, { mcp: false });
     assert.deepEqual(off.mcp, []);
     assert.equal(existsSync(dataDir), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig/applyConfigPatch: planning writes no package mcp data dir; applying an opted-in server does", () => {
+  const root = makeTemp();
+  try {
+    const mcp = {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "stdio", command: "npx", args: ["-y", "server"] },
+      },
+    };
+    const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
+    const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
+    // Pre-existing dirs are removed so any creation below is provably ours;
+    // the untrusted fixture package needs explicit consent to be admitted.
+    rmSync(dataDir, { recursive: true, force: true });
+
+    // Planning alone (even with the server planned and mcp opted in) must
+    // not create the package's data directory.
+    const plan = planConfig([a], {}, { mcp: true }, { mcp: ["alpha"] });
+    assert.deepEqual(plan.mcp.map((m) => m.key), ["srv"]);
+    assert.equal(existsSync(dataDir), false);
+
+    // Applying the plan with mcp opted in registers the server and only at
+    // that point creates its data directory.
+    const cfg = {};
+    applyConfigPatch(cfg, plan, { mcp: true, agents: false });
+    assert.deepEqual(Object.keys(cfg.mcp), ["srv"]);
+    assert.equal(existsSync(dataDir), true);
   } finally {
     cleanup(root);
   }

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "./log.js";
@@ -209,11 +209,6 @@ export function readMcp(
             ? expandPluginVars(server.cwd, pkg.root, dataDir)
             : String(server.cwd);
         log(`dropping cwd "${cwd}" for MCP server "${pkg.name}/${name}": opencode has no cwd support`);
-      }
-      try {
-        mkdirSync(dataDir, { recursive: true });
-      } catch {
-        // Non-fatal: the subprocess env still points at the (uncreated) dir.
       }
       // Safe floor: package-supplied servers are registered disabled so
       // opencode never spawns the package-declared binary at startup on
