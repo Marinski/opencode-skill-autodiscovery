@@ -187,11 +187,25 @@ deliberately, vouched for by a manifest:
 - user-supplied `extraRoots`: the plugin cannot vouch for whatever you point it at.
 - manifest-less directory walks (e.g. cloned-but-uninstalled marketplace folders).
 
-Trust decides whether content gets *registered*, not whether it is safe: a
-registered skill's `SKILL.md` becomes prompt material in your sessions. The
-`$schema` check identifies format only — never provenance or safety. Any package
-can copy the literal schema URL, so a conformant manifest proves nothing about
-who wrote it.
+### Graduated default
+
+Trust gates the two component tiers differently:
+
+- **Skills and slash commands register for every tier.** Both are read-only
+  content registration — surfacing a package's skills is the plugin's job, so
+  trust never blocks them. An untrusted package's skills and commands are
+  registered exactly like a trusted one's, but each untrusted package emits a
+  one-line info log naming the package and its source, so side-effect content
+  entering the session stays visible. `exclude` remains the deny side.
+- **MCP servers and agents are default-off for untrusted packages.** The
+  `mcp` / `agents` switches admit servers and agents from trusted packages
+  directly; an untrusted package contributes them only when the package is
+  listed under `consent.mcp` / `consent.agents`.
+
+Trust never decides whether content is *safe*: a registered skill's
+`SKILL.md` becomes prompt material in your sessions. The `$schema` check
+identifies format only — never provenance or safety. Any package can copy the
+literal schema URL, so a conformant manifest proves nothing about who wrote it.
 
 ### `mcp` and `agents` register package content
 

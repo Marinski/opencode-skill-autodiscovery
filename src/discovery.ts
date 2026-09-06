@@ -725,6 +725,16 @@ export function planConfig(
   const skillTrust: ConfigPatch["skillTrust"] = [];
   const seenDir = new Set<string>();
   for (const pkg of packages) {
+    // Graduated default, permissive half: skills and slash commands are
+    // read-only content registration and stay allowed for every trust tier —
+    // surfacing them is the plugin's job. An untrusted package registers
+    // exactly like a trusted one, but emits one info line so side-effect
+    // content entering the session stays visible to the user.
+    if (!pkg.trusted && pkg.skillDirs.length > 0) {
+      log(
+        `registering skills and slash commands for untrusted package "${pkg.name}" (${pkg.source})`,
+      );
+    }
     for (const dir of pkg.skillDirs) {
       if (seenDir.has(dir)) continue;
       seenDir.add(dir);

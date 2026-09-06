@@ -1714,6 +1714,56 @@ test("planConfig: collapses the same conformant package across sources", () => {
   }
 });
 
+test("planConfig: untrusted packages still register skills and commands, with one info log line each; trusted packages log nothing", () => {
+  const root = makeTemp();
+  try {
+    // The permissive half of the graduated default: skills and slash commands
+    // are read-only content registration, so trust never blocks them. An
+    // untrusted package registers exactly like a trusted one, but emits one
+    // info line naming the package and its source so side-effect content
+    // entering the session stays visible. Test fixtures build packages
+    // untrusted by default; the trusted one is vouched for explicitly.
+    const untrusted = readPackage(
+      makePackage(join(root, "alpha"), "alpha", ["spec", "extra"]),
+      "node_modules",
+    );
+    const trusted = readPackage(
+      makePackage(join(root, "beta"), "beta", ["spec"]),
+      "opencode-cache",
+      true,
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let plan;
+    try {
+      plan = planConfig([trusted, untrusted]);
+    } finally {
+      console.error = origError;
+    }
+
+    // Both tiers register the same content: a skill path per skill dir and a
+    // slash command per valid frontmatter name, collisions namespaced.
+    assert.equal(plan.skillPaths.length, 3);
+    assert.deepEqual(plan.commands.map((c) => c.name).sort(), [
+      "alpha-spec",
+      "extra",
+      "spec",
+    ]);
+    // Only the untrusted package logged, exactly one info line naming it and
+    // its source; the trusted package keeps current (silent) behavior.
+    assert.equal(logs.length, 1);
+    assert.match(
+      logs[0],
+      /registering skills and slash commands for untrusted package "alpha"/,
+    );
+    assert.match(logs[0], /node_modules/);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("exclude: a named package is suppressed from every source type", () => {
   const root = makeTemp();
   try {
@@ -1856,9 +1906,12 @@ test("planConfig: hostile SKILL.md frontmatter names are skipped loudly and leav
     // Skipped entries: the hostile frontmatter names become no command...
     assert.deepEqual(plan.commands.map((c) => c.name), ["good"]);
     // ...and each rejection emitted exactly one loud line naming the
-    // package, the source ('skill frontmatter'), and a reason.
-    assert.equal(logs.length, badNames.length);
-    for (const line of logs) {
+    // package, the source ('skill frontmatter'), and a reason. (The
+    // fixture package is untrusted, so its skills also register with the
+    // graduated-default info line; only the rejection lines are counted.)
+    const hostileLogs = logs.filter((line) => line.includes("invalid name"));
+    assert.equal(hostileLogs.length, badNames.length);
+    for (const line of hostileLogs) {
       assert.match(line, /package "pkg"/);
       assert.match(line, /skill frontmatter/);
       assert.match(line, /invalid name/);
