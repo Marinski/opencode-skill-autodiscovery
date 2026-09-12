@@ -6,7 +6,8 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { log, sanitize } from "./log.js";
 import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
@@ -460,17 +461,32 @@ function agentPluginDirs(roots: string[]): string[] {
   return [...dirs];
 }
 
+// Resolves an `installed.json` `pluginUri` to an on-disk plugin root. Only
+// `file:` URLs name a local directory: non-file schemes and malformed URLs are
+// dropped (with a log) rather than echoed into the filesystem, and the
+// resolved target must be an existing directory. `fileURLToPath` owns the
+// slash/percent/drive-letter normalization; `resolve` then canonicalizes the
+// result so a technically valid URL like `file:////abs` yields the same root
+// string as its `file:///abs` spelling.
 function vscodePluginPath(pluginUri: string): string | null {
-  const m = /^file:\/\/(.+)$/.exec(pluginUri);
-  if (!m) return pluginUri;
-  let raw: string;
+  let resolved: string;
   try {
-    raw = decodeURIComponent(m[1]);
+    resolved = resolve(fileURLToPath(pluginUri));
   } catch {
-    raw = m[1];
+    log(`ignoring plugin URI "${pluginUri}": not a resolvable file: URL`);
+    return null;
   }
-  if (raw.startsWith("/")) raw = raw.slice(1);
-  return raw;
+  // `file://` (and `file:///`) resolve to the filesystem root; a plugin root
+  // is never the root itself, and walking it would scan the whole disk.
+  if (dirname(resolved) === resolved) {
+    log(`ignoring plugin URI "${pluginUri}": filesystem root is not a plugin root`);
+    return null;
+  }
+  if (!isDirectory(resolved)) {
+    log(`ignoring plugin URI "${pluginUri}": "${resolved}" is not a directory`);
+    return null;
+  }
+  return resolved;
 }
 
 export function collectVscodeManifest(

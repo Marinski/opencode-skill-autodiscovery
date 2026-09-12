@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import {
   applyConfigPatch,
   collectClaude,
@@ -1052,6 +1052,81 @@ test("collectVscodeManifest: resolves pluginUri entries from installed.json", ()
     assert.equal(out.length, 1);
     assert.equal(out[0].name, "beta");
     assert.equal(out[0].skillDirs.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: a pluginUri traversing outside the declaring root is rejected", () => {
+  const root = makeTemp();
+  const escapee = makeTemp("oc-escaped-");
+  cleanup(escapee); // the traversal target must not exist
+  try {
+    makePackage(join(root, "pkg"), "inside", ["s"]);
+    const base = root.replace(/\\/g, "/");
+    // The URL parser collapses the literal `..` segments, so this URI names
+    // <tmpdir>/<escapee> — outside the declaring root and not an existing
+    // directory, so it is rejected. (Containment of *existing* outside roots
+    // for untrusted manifests is added in a later task.)
+    const uri = `file:///${base}/pkg/../../${basename(escapee)}`;
+    const manifestPath = join(root, "installed.json");
+    writeFileSync(manifestPath, JSON.stringify({ installed: [{ pluginUri: uri }] }));
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscodeManifest(out, manifestPath);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(out.length, 0, "escaped plugin root is not admitted");
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /is not a directory/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: non-file schemes and non-directory targets are rejected", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(join(root, "pkg"), "beta", ["t"]);
+    const fileTarget = join(root, "not-a-dir.txt");
+    writeFileSync(fileTarget, "not a directory");
+    const manifestPath = join(root, "installed.json");
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        installed: [
+          { pluginUri: "vscode://synced/bundle" },
+          { pluginUri: "file:///" },
+          { pluginUri: `file:///${fileTarget.replace(/\\/g, "/")}` },
+          { pluginUri: `file:///${pkgDir.replace(/\\/g, "/")}` },
+        ],
+      }),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscodeManifest(out, manifestPath);
+    } finally {
+      console.error = origError;
+    }
+
+    // Only the `file:` URI naming an existing, non-root directory survives;
+    // the backslash-normalized fixture resolves to the canonical absolute root.
+    assert.deepEqual(out.map((p) => p.name), ["beta"]);
+    assert.equal(out[0].root, resolve(pkgDir));
+    assert.equal(logs.length, 3);
+    assert.match(logs[0], /not a resolvable file: URL/);
+    assert.match(logs[1], /filesystem root is not a plugin root/);
+    assert.match(logs[2], /is not a directory/);
   } finally {
     cleanup(root);
   }
