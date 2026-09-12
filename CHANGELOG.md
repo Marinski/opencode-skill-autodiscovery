@@ -28,5 +28,9 @@ This release contains a breaking change, so the major version is bumped from
   `extraRoots`, and manifest-less walks are untrusted. The README also states
   that enabling `mcp` or `agents` trusts every discovered package with matching
   executable config, and recommends pairing those flags with `exclude`.
+- VS Code manifests (`installed.json`, `cache.json`) discovered under a
+  user-supplied `extraRoots` entry are now untrusted, and the package roots
+  they name must resolve inside that entry. Built-in VS Code home roots keep
+  their current behavior and may still reference a global extension directory.
 
 [2.0.0]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v1.4.0...v2.0.0

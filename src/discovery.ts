@@ -31,9 +31,10 @@ export type PluginPackage = {
   source: PackageSource;
   /**
    * Two-tier trust model. True when the content was installed or fetched
-   * deliberately via a host tool or opencode itself (claude/vscode manifests,
-   * opencode's package cache). False when present merely as a side effect
-   * (project node_modules, manifest-less walks over user-supplied extra roots).
+   * deliberately via a host tool or opencode itself (claude/vscode manifests
+   * under home roots, opencode's package cache). False when present merely as
+   * a side effect (project node_modules, manifest-less walks, and any package
+   * reached through a user-supplied extra root).
    */
   trusted: boolean;
   name: string;
@@ -424,9 +425,14 @@ export function packageFromDir(
 // `agentPlugins` on newer builds; remote servers nest theirs under `data/`
 // (~/.vscode-server/data/agentPlugins). We list every known candidate so the
 // discovery works regardless of OS, build channel, or local/remote setup.
-function vsCodeDataRoots(extra: string[]): string[] {
+//
+// A data root carries its provenance: built-in per-platform home roots are
+// trusted (VS Code itself owns them), while user-supplied `extraRoots` are not.
+type DataRoot = { root: string; trusted: boolean };
+
+function vsCodeDataRoots(extra: string[]): DataRoot[] {
   const home = homedir();
-  const roots = new Set<string>([
+  const builtIn = new Set<string>([
     join(home, ".vscode"),
     // Linux
     join(home, ".config", "Code"),
@@ -446,19 +452,32 @@ function vsCodeDataRoots(extra: string[]): string[] {
     join(home, ".vscode-server-insiders"),
     join(home, ".vscode-remote"),
   ]);
-  for (const root of extra) roots.add(root);
-  return [...roots];
+  const roots: DataRoot[] = [...builtIn].map((root) => ({ root, trusted: true }));
+  const seen = new Set(builtIn);
+  for (const root of extra) {
+    if (seen.has(root)) continue;
+    seen.add(root);
+    roots.push({ root, trusted: false });
+  }
+  return roots;
 }
 
-function agentPluginDirs(roots: string[]): string[] {
-  const dirs = new Set<string>();
-  for (const root of roots) {
-    dirs.add(join(root, "agent-plugins"));
-    dirs.add(join(root, "agentPlugins"));
-    dirs.add(join(root, "data", "agent-plugins"));
-    dirs.add(join(root, "data", "agentPlugins"));
+function agentPluginDirs(roots: DataRoot[]): DataRoot[] {
+  const seen = new Set<string>();
+  const dirs: DataRoot[] = [];
+  for (const { root, trusted } of roots) {
+    for (const dir of [
+      join(root, "agent-plugins"),
+      join(root, "agentPlugins"),
+      join(root, "data", "agent-plugins"),
+      join(root, "data", "agentPlugins"),
+    ]) {
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      dirs.push({ root: dir, trusted });
+    }
   }
-  return [...dirs];
+  return dirs;
 }
 
 // Resolves an `installed.json` `pluginUri` to an on-disk plugin root. Only
@@ -493,6 +512,7 @@ export function collectVscodeManifest(
   out: PluginPackage[],
   installedJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
   let manifest: { installed?: Array<{ pluginUri?: string }> };
@@ -501,13 +521,22 @@ export function collectVscodeManifest(
   } catch {
     return;
   }
+  const root = dirname(installedJson);
   for (const plugin of manifest.installed ?? []) {
     if (!plugin.pluginUri) continue;
     const dir = vscodePluginPath(plugin.pluginUri);
-    if (dir) {
-      const pkg = packageFromDir(dir, "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    if (!dir) continue;
+    // installed.json is manifest input: under an untrusted root the recorded
+    // install location must resolve inside that root. A trusted home root is
+    // allowed to point at a global extension directory outside the data root.
+    if (!trusted && !contains(root, dir)) {
+      log(
+        `skipping plugin URI "${plugin.pluginUri}": "${dir}" is outside untrusted root "${root}"`,
+      );
+      continue;
     }
+    const pkg = packageFromDir(dir, "vscode", trusted);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
@@ -522,6 +551,7 @@ export function collectVscodeCache(
   out: PluginPackage[],
   cacheJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(cacheJson)) return;
   let entries: CacheEntry[];
@@ -539,17 +569,22 @@ export function collectVscodeCache(
       typeof entry.nonce === "string" && entry.nonce
         ? sanitizeKey(entry.nonce)
         : "default";
+    // Layouts without the {nonce} subdirectory materialize the bundle
+    // directly under {key}; falling back only when the nonce dir is absent
+    // avoids re-descending into it.
     const nonceDir = join(parent, key, nonce);
-    if (isDirectory(nonceDir)) {
-      const pkg = packageFromDir(nonceDir, "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
-    } else {
-      // Layouts without the {nonce} subdirectory materialize the bundle
-      // directly under {key}; walking it only when the nonce dir is absent
-      // avoids re-descending into it.
-      const pkg = packageFromDir(join(parent, key), "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    const dir = isDirectory(nonceDir) ? nonceDir : join(parent, key);
+    if (!isDirectory(dir)) continue;
+    // cache.json is manifest input: under an untrusted root the bundle must
+    // resolve inside that root, not be redirected elsewhere on disk.
+    if (!trusted && !contains(parent, dir)) {
+      log(
+        `skipping cache entry "${entry.uri}": "${dir}" is outside untrusted root "${parent}"`,
+      );
+      continue;
     }
+    const pkg = packageFromDir(dir, "vscode", trusted);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
@@ -567,11 +602,12 @@ function collectAgentPluginRoot(
   out: PluginPackage[],
   root: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   const installedJson = join(root, "installed.json");
   const cacheJson = join(root, "cache.json");
-  collectVscodeManifest(out, installedJson, exclude);
-  collectVscodeCache(out, cacheJson, exclude);
+  collectVscodeManifest(out, installedJson, exclude, trusted);
+  collectVscodeCache(out, cacheJson, exclude, trusted);
   // `installed.json` is the authoritative record of what VS Code installed;
   // when it exists, respect it exactly and skip the fallback walk so
   // cloned-but-not-installed marketplaces stay hidden.
@@ -596,17 +632,22 @@ export function collectVscode(
   extra: string[],
   exclude: string[] = [],
 ): void {
-  for (const dir of agentPluginDirs(vsCodeDataRoots(extra))) {
-    collectAgentPluginRoot(out, dir, exclude);
+  for (const { root, trusted } of agentPluginDirs(vsCodeDataRoots(extra))) {
+    collectAgentPluginRoot(out, root, exclude, trusted);
   }
 }
 
 // --- Claude Code plugin discovery ------------------------------------------
 
+// `trusted` defaults to true: every Claude root is home-scoped and
+// host-managed (`~/.claude/...`), so it stays trusted. The parameter exists
+// for symmetry with the VS Code collectors, letting a caller mark a non-home
+// manifest untrusted.
 export function collectClaudeManifest(
   out: PluginPackage[],
   installedJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
   let manifest: { plugins?: Record<string, Array<{ installPath?: string }>> };
@@ -618,7 +659,7 @@ export function collectClaudeManifest(
   for (const versions of Object.values(manifest.plugins ?? {})) {
     for (const plugin of versions) {
       if (plugin.installPath) {
-        const pkg = packageFromDir(plugin.installPath, "claude", true);
+        const pkg = packageFromDir(plugin.installPath, "claude", trusted);
         if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
       }
     }

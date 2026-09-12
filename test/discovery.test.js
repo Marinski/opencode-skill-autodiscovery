@@ -44,6 +44,21 @@ function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// Points homedir() at `dir` for the duration of a test and returns a restore
+// function. Used to exercise the built-in (trusted) home roots hermetically.
+function useHome(dir) {
+  const oldHome = process.env.HOME;
+  const oldUser = process.env.USERPROFILE;
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  return () => {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    if (oldUser === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = oldUser;
+  };
+}
+
 function makePackage(root, name, skills = [], mcp = null) {
   mkdirSync(root, { recursive: true });
   writeFileSync(
@@ -1067,7 +1082,7 @@ test("collectVscodeManifest: a pluginUri traversing outside the declaring root i
     // The URL parser collapses the literal `..` segments, so this URI names
     // <tmpdir>/<escapee> — outside the declaring root and not an existing
     // directory, so it is rejected. (Containment of *existing* outside roots
-    // for untrusted manifests is added in a later task.)
+    // under an untrusted root is covered below.)
     const uri = `file:///${base}/pkg/../../${basename(escapee)}`;
     const manifestPath = join(root, "installed.json");
     writeFileSync(manifestPath, JSON.stringify({ installed: [{ pluginUri: uri }] }));
@@ -1132,6 +1147,101 @@ test("collectVscodeManifest: non-file schemes and non-directory targets are reje
   }
 });
 
+test("collectVscode: an untrusted extra root cannot register a package outside itself", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  const restoreHome = useHome(emptyHome);
+  try {
+    const escapedPkg = makePackage(join(outside, "pkg"), "planted", ["s"]);
+    const agentPlugins = join(root, "agentPlugins");
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${escapedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscode(out, [root]);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(
+      out.some((p) => p.name === "planted"),
+      false,
+      "escaped reference under an untrusted root is skipped",
+    );
+    assert.ok(
+      logs.some((line) => line.includes(agentPlugins)),
+      "log names the untrusted root",
+    );
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("collectVscode: a contained package under an untrusted extra root is untrusted", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const restoreHome = useHome(emptyHome);
+  try {
+    const agentPlugins = join(root, "agentPlugins");
+    const containedPkg = makePackage(join(agentPlugins, "pkg"), "contained", ["s"]);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${containedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, [root]);
+    const pkg = out.find((p) => p.name === "contained");
+    assert.ok(pkg, "contained package discovered");
+    assert.equal(pkg.trusted, false, "extra-root manifest package is untrusted");
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+  }
+});
+
+test("collectVscode: a contained package under a built-in home root stays trusted", () => {
+  const home = makeTemp("oc-home-");
+  const restoreHome = useHome(home);
+  try {
+    const agentPlugins = join(home, ".vscode", "agent-plugins");
+    const containedPkg = makePackage(join(agentPlugins, "pkg"), "contained", ["s"]);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${containedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, []);
+    const pkg = out.find((p) => p.name === "contained");
+    assert.ok(pkg, "home-root package discovered");
+    assert.equal(pkg.trusted, true, "home-root manifest package stays trusted");
+  } finally {
+    restoreHome();
+    cleanup(home);
+  }
+});
+
 test("collectVscodeCache: resolves synced bundles with and without a nonce subdir", () => {
   const root = makeTemp();
   try {
@@ -1154,6 +1264,98 @@ test("collectVscodeCache: resolves synced bundles with and without a nonce subdi
     // The with-nonce bundle must not be discovered twice via the {key} walk.
     assert.equal(out.filter((p) => p.name === "synced").length, 1);
   } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeCache: an untrusted extra root cannot follow a cache entry outside itself", (t) => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  const restoreHome = useHome(emptyHome);
+  try {
+    const outsideBundle = makePackage(join(outside, "bundle"), "cached", ["s"]);
+    const agentPlugins = join(root, "agentPlugins");
+    mkdirSync(agentPlugins, { recursive: true });
+    // installed.json pins the manifest loader to an empty list so the
+    // manifest-less fallback walk does not also run; this isolates the
+    // cache.json path under test.
+    writeFileSync(join(agentPlugins, "installed.json"), JSON.stringify({ installed: [] }));
+    // The sanitized {key} directory is a symlink that resolves outside the
+    // untrusted root, so the cache entry must not be followed.
+    try {
+      symlinkSync(
+        outsideBundle,
+        join(agentPlugins, "vscode-synced-escaping"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    writeFileSync(
+      join(agentPlugins, "cache.json"),
+      JSON.stringify([{ uri: "vscode://synced/escaping" }]),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscode(out, [root]);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(out.some((p) => p.name === "cached"), false, "escaped cache bundle is skipped");
+    assert.ok(logs.some((line) => line.includes(agentPlugins)), "log names the untrusted root");
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("planConfig: an extra-root package still needs the mcp opt-in to contribute servers", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const restoreHome = useHome(emptyHome);
+  try {
+    const agentPlugins = join(root, "agentPlugins");
+    const mcp = {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        planted: { type: "stdio", command: "npx", args: ["-y", "server"] },
+      },
+    };
+    const pkgDir = makePackage(join(agentPlugins, "pkg"), "extra-pkg", ["s"], mcp);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${pkgDir.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, [root]);
+    const pkg = out.find((p) => p.name === "extra-pkg");
+    assert.ok(pkg, "extra-root package discovered");
+    assert.equal(pkg.trusted, false, "extra-root manifest package is untrusted");
+
+    // The trust tier never substitutes for the explicit opt-in: without it no
+    // servers are planned...
+    assert.deepEqual(planConfig([pkg], {}, { mcp: false }).mcp, []);
+    // ...and only with it does the package contribute.
+    assert.deepEqual(
+      planConfig([pkg], {}, { mcp: true }).mcp.map((m) => m.key),
+      ["planted"],
+    );
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
     cleanup(root);
   }
 });
