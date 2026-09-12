@@ -291,22 +291,58 @@ function hasRootAgentFiles(root: string): boolean {
 // clone, and inside a marketplace like agency-agents each
 // ref_plugins/plugins/<division> dir), so a clone on disk is registered
 // per-plugin instead of as one opaque tree that hides its agents.
+//
+// Hardened like findSkillDirs: traversal and emitted roots are keyed on real
+// (symlink-resolved) paths, so symlink cycles — self-referential or
+// ancestor-pointing — terminate instead of growing ever-longer lexical paths
+// until stack exhaustion, and nothing that resolves outside the starting root
+// is emitted. `isDirectory` uses statSync, which follows symlinks, so the
+// realpath dedupe below is what bounds the walk.
 export function findPluginRoots(root: string, out: string[]): void {
-  if (hasPluginLayout(root)) {
-    out.push(root);
+  let resolved: string;
+  try {
+    resolved = realpathSync(root);
+  } catch {
+    return;
+  }
+  findPluginRootsUnder(resolved, resolved, out, new Set());
+}
+
+function findPluginRootsUnder(
+  realRoot: string,
+  dir: string,
+  out: string[],
+  seen: Set<string>,
+  depth = 0,
+) {
+  if (depth > MAX_WALK_DEPTH) return;
+  if (seen.has(dir)) return;
+  seen.add(dir);
+  if (hasPluginLayout(dir)) {
+    out.push(dir);
     return;
   }
   let entries: string[];
   try {
-    entries = readdirSync(root);
+    entries = readdirSync(dir);
   } catch {
     return;
   }
   for (const entry of entries) {
     if (entry === ".git" || entry === "node_modules") continue;
-    const full = join(root, entry);
+    const full = join(dir, entry);
     if (!isDirectory(full)) continue;
-    findPluginRoots(full, out);
+    let child: string;
+    try {
+      child = realpathSync(full);
+    } catch {
+      continue;
+    }
+    if (!contains(realRoot, child)) {
+      log(`skipping plugin dir "${child}": resolves outside "${realRoot}"`);
+      continue;
+    }
+    findPluginRootsUnder(realRoot, child, out, seen, depth + 1);
   }
 }
 

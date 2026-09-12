@@ -21,6 +21,7 @@ import {
   collectVscodeCache,
   collectVscodeManifest,
   contains,
+  findPluginRoots,
   findSkillDirs,
   packageFromDir,
   planConfig,
@@ -494,6 +495,103 @@ test("findSkillDirs: depth cap stops the descent past 16 levels", () => {
 
     const out = new Set();
     findSkillDirs(root, out, new Set());
+    assert.deepEqual(goldenPaths(root, out), [
+      [...segments.slice(0, 14), "in-cap"].join("/"),
+    ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+// findPluginRoots backs the VS Code/claude fallback walks over on-disk plugin
+// trees. Like findSkillDirs it must terminate on symlink cycles and never emit
+// a root that resolves outside the walked tree.
+
+test("findPluginRoots: terminates on a self-referential symlink cycle", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  try {
+    // VS Code-style data root: github.com/{org}/{repo} plugin clones.
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    symlinkSync(
+      root,
+      join(root, "self"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // Completing at all is the bound: the old lexical walk recursed on
+    // root/self/self/self/... until stack exhaustion. Only the real, in-root
+    // plugin clone is emitted.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findPluginRoots: terminates when a descendant links back to an ancestor", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  try {
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    symlinkSync(
+      root,
+      join(root, "github.com", "back"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // `github.com/back` resolves to the already-visited ancestor and must not
+    // be re-walked; only the real, in-root plugin clone is emitted.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findPluginRoots: never emits a plugin root symlinked outside the walk root", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    makePackage(join(outside, "evil"), "evil", ["s"]);
+    symlinkSync(
+      join(outside, "evil"),
+      join(root, "github.com", "escape"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // The escaping link resolves outside `root`: neither it nor its plugin
+    // root may be emitted, even though the link itself sits inside the tree.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("findPluginRoots: depth cap stops the descent past 16 levels", () => {
+  const root = makeTemp();
+  try {
+    // A plain nested chain (no symlinks): a plugin root inside the cap is
+    // found, one far below it is not, and the walk always terminates.
+    const segments = Array.from({ length: 20 }, (_, i) => `l${i}`);
+    writeSkillDir(join(root, ...segments, "too-deep"), "too-deep");
+    writeSkillDir(join(root, ...segments.slice(0, 14), "in-cap"), "in-cap");
+
+    const out = [];
+    findPluginRoots(root, out);
     assert.deepEqual(goldenPaths(root, out), [
       [...segments.slice(0, 14), "in-cap"].join("/"),
     ]);
