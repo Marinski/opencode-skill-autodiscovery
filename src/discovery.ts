@@ -86,6 +86,26 @@ export function contains(parent: string, child: string): boolean {
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+// Resolves `candidate` to its real path and returns it only when it still
+// lives inside `root` (through symlinks); returns null when it is missing or
+// escapes. This is the read gate for package files whose bytes feed config:
+// a package must not be able to ship a symlink (mcp.json, AGENTS.md, a flat
+// agent .md) that reads a file it never contained. A rejected candidate is
+// logged once, naming the package root and the outside target.
+export function resolveContained(root: string, candidate: string): string | null {
+  let resolved: string;
+  try {
+    resolved = realpathSync(candidate);
+  } catch {
+    return null;
+  }
+  if (!contains(root, resolved)) {
+    log(`skipping "${resolved}": resolves outside "${root}"`);
+    return null;
+  }
+  return resolved;
+}
+
 // Parses the YAML frontmatter of a SKILL.md (name, description). Returns null
 // when the file is unreadable or lacks a valid `name`.
 export function readSkillInfo(dir: string): SkillInfo | null {
@@ -166,9 +186,12 @@ export function readPackage(
     }
   }
 
-  const mcpPath = isRegularFile(join(root, "mcp.json"))
-    ? join(root, "mcp.json")
-    : undefined;
+  // mcp.json is package-supplied input read into config.mcp: resolve it
+  // through the containment gate first, so a symlink cannot point it at a
+  // file outside the package.
+  const mcpResolved = resolveContained(root, join(root, "mcp.json"));
+  const mcpPath =
+    mcpResolved && isRegularFile(mcpResolved) ? mcpResolved : undefined;
 
   return {
     source,
@@ -280,9 +303,9 @@ function hasRootAgentFiles(root: string): boolean {
   }
   return entries.some((e) => {
     if (!e.endsWith(".md")) return false;
-    const full = join(root, e);
-    if (!isRegularFile(full)) return false;
-    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(full, "utf8"))?.[1];
+    const contained = resolveContained(root, join(root, e));
+    if (!contained || !isRegularFile(contained)) return false;
+    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(contained, "utf8"))?.[1];
     if (!m) return false;
     return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
   });

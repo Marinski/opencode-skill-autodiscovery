@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { log } from "./log.js";
 import { validateName } from "./schema.js";
+import { resolveContained } from "./discovery.js";
 import type { PluginPackage } from "./discovery.js";
 
 // opencode's config.agent shape (subset of the SDK's AgentConfig). Permission
@@ -233,13 +234,19 @@ export function readAgents(
       if (typeof src.systemPrompt === "string" && src.systemPrompt) {
         agent.prompt = src.systemPrompt;
       } else {
-        try {
-          agent.prompt = readFileSync(
-            join(pkg.root, "agents", name, "AGENTS.md"),
-            "utf8",
-          );
-        } catch {
-          // No prompt file; the description alone is enough to register.
+        // AGENTS.md is package-supplied prompt content: only read it when it
+        // resolves inside the package, so a symlinked shim cannot pull in an
+        // outside file's bytes.
+        const promptPath = resolveContained(
+          pkg.root,
+          join(pkg.root, "agents", name, "AGENTS.md"),
+        );
+        if (promptPath) {
+          try {
+            agent.prompt = readFileSync(promptPath, "utf8");
+          } catch {
+            // No prompt file; the description alone is enough to register.
+          }
         }
       }
       if (typeof src.model === "string") agent.model = src.model;
@@ -272,9 +279,14 @@ export function readAgents(
         continue;
       }
       if (out.has(name)) continue;
+      // Flat agent files are package-supplied prompt content: only read one
+      // when it resolves inside the package, so a symlinked .md cannot pull in
+      // an outside file's bytes.
+      const contained = resolveContained(pkg.root, join(flatAgentsDir, entry));
+      if (!contained) continue;
       let content: string;
       try {
-        content = readFileSync(join(flatAgentsDir, entry), "utf8");
+        content = readFileSync(contained, "utf8");
       } catch {
         continue;
       }
