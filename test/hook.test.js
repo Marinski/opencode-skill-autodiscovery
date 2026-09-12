@@ -310,3 +310,23 @@ test("config hook: no plugin-data directory without flags or with an unparseable
   await runHook({ scanNodeModules: true, mcp: true });
   assert.equal(existsSync(pluginDataRoot), false, "no plugin-data root for unparseable mcp.json");
 });
+
+test("config hook: non-string extraRoots/exclude entries are filtered per-entry", async () => {
+  // A malformed option array must not abort the hook: the valid root is still
+  // scanned (it would not be reached if path.join saw 42 or null), and a
+  // non-string exclude entry is tolerated rather than rejecting the array.
+  makePackage(join(envRoot, "ok", "agent-plugins"), "extraok", ["xs"]);
+  const cfg = await runHook({
+    extraRoots: ["ok", 42, null],
+    exclude: [1],
+  });
+  assert.equal(
+    cfg.command.xs.template.includes('Load the "xs" skill'),
+    true,
+    "valid extra root discovered despite non-string siblings",
+  );
+  const found = cfg.skills.paths.filter(
+    (p) => p.endsWith("skills\\xs") || p.endsWith("skills/xs"),
+  );
+  assert.equal(found.length, 1, "one skill path from the valid extra root");
+});
