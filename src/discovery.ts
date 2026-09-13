@@ -185,7 +185,13 @@ export function readPackage(
     for (const entry of entries) {
       const dir = join(skillsRoot, entry);
       if (!isDirectory(dir)) continue;
-      if (!isRegularFile(join(dir, "SKILL.md"))) continue;
+      const skillMd = join(dir, "SKILL.md");
+      if (!isRegularFile(skillMd)) continue;
+      // The directory alone is not enough: a package can keep the skill dir
+      // in-root while symlinking its SKILL.md to an outside file, whose bytes
+      // would otherwise become prompt material. Require the skill file itself
+      // to resolve inside the package too.
+      if (!resolveContained(root, skillMd)) continue;
       let resolved: string;
       try {
         resolved = realpathSync(dir);
@@ -275,7 +281,11 @@ function findSkillDirsUnder(
       log(`skipping skill dir "${child}": resolves outside "${realRoot}"`);
       continue;
     }
-    if (isRegularFile(join(child, "SKILL.md"))) {
+    const childSkillMd = join(child, "SKILL.md");
+    if (isRegularFile(childSkillMd)) {
+      // A skill dir whose SKILL.md symlinks outside the walk root must not be
+      // emitted: readSkillInfo (and opencode) would read the outside bytes.
+      if (!resolveContained(realRoot, childSkillMd)) continue;
       out.add(child);
     } else {
       findSkillDirsUnder(realRoot, child, out, seen, depth + 1);
@@ -290,7 +300,12 @@ function hasPluginLayout(root: string): boolean {
   const skillsRoot = join(root, "skills");
   if (isDirectory(skillsRoot)) {
     try {
-      if (readdirSync(skillsRoot).some((e) => isRegularFile(join(skillsRoot, e, "SKILL.md")))) {
+      if (
+        readdirSync(skillsRoot).some((e) => {
+          const skillMd = join(skillsRoot, e, "SKILL.md");
+          return resolveContained(root, skillMd) !== null && isRegularFile(skillMd);
+        })
+      ) {
         return true;
       }
     } catch {
@@ -385,10 +400,13 @@ function findPluginRootsUnder(
 // True when a legacy Claude Code plugin declares at least one agent, so an
 // agents-only plugin is still discovered even though it ships no skills.
 function hasClaudeAgents(root: string): boolean {
+  const manifestPath = resolveContained(
+    root,
+    join(root, ".claude-plugin", "plugin.json"),
+  );
+  if (!manifestPath) return false;
   try {
-    const manifest: unknown = JSON.parse(
-      readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"),
-    );
+    const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
     if (typeof manifest !== "object" || manifest === null) return false;
     const agents = (manifest as Record<string, unknown>).agents;
     return (
@@ -406,8 +424,11 @@ function hasClaudeAgents(root: string): boolean {
 // even without a manifest `agents` field.
 function hasFlatAgents(root: string): boolean {
   if (hasRootAgentFiles(root)) return true;
+  const agentsDir = join(root, "agents");
   try {
-    return readdirSync(join(root, "agents")).some((e) => e.endsWith(".md"));
+    return readdirSync(agentsDir).some(
+      (e) => e.endsWith(".md") && resolveContained(root, join(agentsDir, e)) !== null,
+    );
   } catch {
     return false;
   }

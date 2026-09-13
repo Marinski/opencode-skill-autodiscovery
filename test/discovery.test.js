@@ -362,6 +362,76 @@ test("readPackage: in-root symlinked mcp.json alias still resolves", (t) => {
   }
 });
 
+test("readPackage: a SKILL.md symlinked outside the package root is not emitted", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, "skills", "evil"), { recursive: true });
+    const outsideMd = join(outside, "SKILL.md");
+    writeFileSync(outsideMd, "---\nname: pwned\ndescription: SECRET SKILL BYTES\n---\n");
+    try {
+      symlinkSync(outsideMd, join(pkgDir, "skills", "evil", "SKILL.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let pkg;
+    let plan;
+    try {
+      pkg = readPackage(pkgDir, "node_modules");
+      plan = planConfig([pkg], {}, {});
+    } finally {
+      console.error = origError;
+    }
+
+    assert.ok(pkg);
+    assert.deepEqual(pkg.skillDirs, [], "no skill dir emitted for an escaping SKILL.md");
+    assert.deepEqual(plan.commands, [], "no command carries the outside bytes");
+    assert.ok(
+      logs.some((line) => line.includes(realpathSync(outsideMd))),
+      "log names the outside target",
+    );
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readPackage: in-root symlinked SKILL.md alias still resolves", (t) => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, "shared"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "shared", "SKILL.md"),
+      "---\nname: aliased\ndescription: aliased description\n---\n",
+    );
+    mkdirSync(join(pkgDir, "skills", "alias"), { recursive: true });
+    try {
+      symlinkSync(
+        join(pkgDir, "shared", "SKILL.md"),
+        join(pkgDir, "skills", "alias", "SKILL.md"),
+        "file",
+      );
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    assert.equal(pkg.skillDirs.length, 1);
+    const plan = planConfig([pkg], {}, {});
+    assert.deepEqual(plan.commands.map((c) => c.name), ["aliased"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
 // --- Legacy-walker parity baseline ------------------------------------------
 // These fixtures pin findSkillDirs' CURRENT output for legitimate nested
 // legacy layouts (nothing escapes, no cycles). The golden lists are the
@@ -592,6 +662,28 @@ test("findSkillDirs: depth cap stops the descent past 16 levels", () => {
     ]);
   } finally {
     cleanup(root);
+  }
+});
+
+test("findSkillDirs: a SKILL.md symlinked outside the walk root is not emitted", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    mkdirSync(join(root, "s"), { recursive: true });
+    const outsideMd = join(outside, "SKILL.md");
+    writeFileSync(outsideMd, "---\nname: pwned\ndescription: SECRET SKILL BYTES\n---\n");
+    try {
+      symlinkSync(outsideMd, join(root, "s", "SKILL.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    assert.deepEqual(goldenPaths(root, out), []);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
   }
 });
 
@@ -1929,6 +2021,119 @@ test("readAgents: in-root symlinked flat agent alias still resolves", (t) => {
     assert.equal(agents[0].agent.prompt, "You review.");
   } finally {
     cleanup(root);
+  }
+});
+
+test("readAgents: symlinked dev.opencode/agents JSON outside the package contributes nothing", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "dev.opencode", "agents"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg" }),
+    );
+    const outsideJson = join(outside, "x.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({ description: "PWNED", prompt: "SECRET OUTSIDE BYTES" }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, "dev.opencode", "agents", "x.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+    assert.ok(
+      logs.some((line) => line.includes(realpathSync(outsideJson))),
+      "log names the outside target",
+    );
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: symlinked .claude-plugin/plugin.json outside the package contributes no agents", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, ".claude-plugin"), { recursive: true });
+    const outsideJson = join(outside, "plugin.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({
+        name: "legacy",
+        agents: { shimmed: { description: "PWNED", systemPrompt: "SECRET OUTSIDE BYTES" } },
+      }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, ".claude-plugin", "plugin.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: symlinked top-level plugin.json extensions outside contribute no agents", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    const outsideJson = join(outside, "plugin.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "evil",
+        extensions: {
+          "dev.opencode": {
+            agents: { helper: { description: "PWNED", prompt: "SECRET OUTSIDE BYTES" } },
+          },
+        },
+      }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, "plugin.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    assert.ok(pkg, "readPackage still identifies the package by its manifest");
+    const agents = readAgents(pkg);
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
   }
 });
 

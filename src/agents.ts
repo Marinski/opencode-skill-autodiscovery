@@ -111,6 +111,18 @@ function readJson(path: string): unknown {
   }
 }
 
+// Package-supplied JSON that feeds agent config (the plugin manifests and the
+// dev.opencode/agents/*.json extension files) is read only when it resolves
+// inside the package root. A symlinked manifest would otherwise let an outside
+// file's `description`/`prompt`/`systemPrompt` fields become model prompt
+// material. Missing files resolve to null silently; an escaping symlink is
+// logged once by resolveContained.
+function readContainedJson(root: string, path: string): unknown {
+  const contained = resolveContained(root, path);
+  if (!contained) return null;
+  return readJson(contained);
+}
+
 // Converts a raw, package-supplied agent object into an opencode AgentConfig.
 // `permission` blocks are dropped (too powerful to inherit by default) and
 // unknown/mistyped keys are ignored. Returns null when nothing usable is left.
@@ -170,7 +182,7 @@ export function readAgents(
 ): Array<{ name: string; agent: AgentConfig }> {
   const out = new Map<string, AgentConfig>();
 
-  const manifest = asRecord(readJson(join(pkg.root, "plugin.json")));
+  const manifest = asRecord(readContainedJson(pkg.root, join(pkg.root, "plugin.json")));
   const extensions = asRecord(manifest?.extensions);
   const opencodeExt = asRecord(extensions?.[OPENCODE_NS]);
   const manifestAgents = asRecord(opencodeExt?.agents);
@@ -209,12 +221,12 @@ export function readAgents(
       continue;
     }
     if (out.has(name)) continue;
-    const agent = toAgentConfig(readJson(join(extDir, entry)));
+    const agent = toAgentConfig(readContainedJson(pkg.root, join(extDir, entry)));
     if (agent) out.set(name, agent);
   }
 
   const claudeManifest = asRecord(
-    readJson(join(pkg.root, ".claude-plugin", "plugin.json")),
+    readContainedJson(pkg.root, join(pkg.root, ".claude-plugin", "plugin.json")),
   );
   const claudeAgents = asRecord(claudeManifest?.agents);
   if (claudeAgents) {
