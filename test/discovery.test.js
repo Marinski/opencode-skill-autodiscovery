@@ -1091,6 +1091,35 @@ test("collectClaudeManifest: resolves installPaths from installed_plugins.json",
   }
 });
 
+test("collectClaudeManifest: malformed manifests fail closed without throwing or emitting", () => {
+  const root = makeTemp();
+  try {
+    const cases = [
+      { label: "plugins: null", body: { plugins: null } },
+      { label: "plugins: { a: {} }", body: { plugins: { a: {} } } },
+      { label: "plugins: { a: [null] }", body: { plugins: { a: [null] } } },
+      { label: "plugins: { a: [{}] }", body: { plugins: { a: [{}] } } },
+    ];
+    const manifestPath = join(root, "installed_plugins.json");
+    for (const { label, body } of cases) {
+      writeFileSync(manifestPath, JSON.stringify(body));
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      const out = [];
+      try {
+        collectClaudeManifest(out, manifestPath);
+      } finally {
+        console.error = origError;
+      }
+      assert.deepEqual(out, [], `${label}: no package emitted`);
+      assert.equal(logs.length, 1, `${label}: exactly one log line`);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectClaude: walks hash-named remote plugin dirs for flat agents and skills", () => {
   const root = makeTemp();
   try {
@@ -1219,6 +1248,35 @@ test("collectVscodeManifest: non-file schemes and non-directory targets are reje
     assert.match(logs[0], /not a resolvable file: URL/);
     assert.match(logs[1], /filesystem root is not a plugin root/);
     assert.match(logs[2], /is not a directory/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: malformed installed fail closed without throwing or emitting", () => {
+  const root = makeTemp();
+  try {
+    const cases = [
+      { label: "installed: null", body: { installed: null } },
+      { label: "installed: {}", body: { installed: {} } },
+      { label: "installed: [null]", body: { installed: [null] } },
+      { label: "installed: [{}]", body: { installed: [{}] } },
+    ];
+    const manifestPath = join(root, "installed.json");
+    for (const { label, body } of cases) {
+      writeFileSync(manifestPath, JSON.stringify(body));
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      const out = [];
+      try {
+        collectVscodeManifest(out, manifestPath);
+      } finally {
+        console.error = origError;
+      }
+      assert.deepEqual(out, [], `${label}: no package emitted`);
+      assert.equal(logs.length, 1, `${label}: exactly one log line`);
+    }
   } finally {
     cleanup(root);
   }

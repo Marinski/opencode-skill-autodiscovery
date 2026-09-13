@@ -77,6 +77,17 @@ function isRegularFile(p: string): boolean {
   }
 }
 
+// True only for a JSON object container: not null, not an array, and not some
+// other object kind. Manifest inputs are parsed JSON, so this rejects every
+// shape other than a plain object before its keys are iterated.
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 // True when `child` resolves (through symlinks) inside `parent`.
 export function contains(parent: string, child: string): boolean {
   const p = realpathSync(parent);
@@ -538,23 +549,38 @@ export function collectVscodeManifest(
   trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
-  let manifest: { installed?: Array<{ pluginUri?: string }> };
+  let manifest: unknown;
   try {
     manifest = JSON.parse(readFileSync(installedJson, "utf8"));
   } catch {
     return;
   }
+  // installed.json is manifest input: fail closed on a malformed shape rather
+  // than iterating a non-array (which throws) or trusting entry types.
+  const installed = isPlainObject(manifest) ? manifest.installed : undefined;
+  if (!Array.isArray(installed)) {
+    log(`ignoring "${installedJson}": "installed" is not an array`);
+    return;
+  }
   const root = dirname(installedJson);
-  for (const plugin of manifest.installed ?? []) {
-    if (!plugin.pluginUri) continue;
-    const dir = vscodePluginPath(plugin.pluginUri);
+  for (const plugin of installed) {
+    if (!isPlainObject(plugin)) {
+      log(`ignoring entry in "${installedJson}": entry is not an object`);
+      continue;
+    }
+    const pluginUri = plugin.pluginUri;
+    if (typeof pluginUri !== "string") {
+      log(`ignoring entry in "${installedJson}": "pluginUri" is not a string`);
+      continue;
+    }
+    const dir = vscodePluginPath(pluginUri);
     if (!dir) continue;
     // installed.json is manifest input: under an untrusted root the recorded
     // install location must resolve inside that root. A trusted home root is
     // allowed to point at a global extension directory outside the data root.
     if (!trusted && !contains(root, dir)) {
       log(
-        `skipping plugin URI "${plugin.pluginUri}": "${dir}" is outside untrusted root "${root}"`,
+        `skipping plugin URI "${pluginUri}": "${dir}" is outside untrusted root "${root}"`,
       );
       continue;
     }
@@ -673,18 +699,37 @@ export function collectClaudeManifest(
   trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
-  let manifest: { plugins?: Record<string, Array<{ installPath?: string }>> };
+  let manifest: unknown;
   try {
     manifest = JSON.parse(readFileSync(installedJson, "utf8"));
   } catch {
     return;
   }
-  for (const versions of Object.values(manifest.plugins ?? {})) {
+  // installed_plugins.json is manifest input: fail closed when `plugins` is not
+  // a plain object, when a version bucket is not an array, or when an entry
+  // lacks a string installPath.
+  const plugins = isPlainObject(manifest) ? manifest.plugins : undefined;
+  if (!isPlainObject(plugins)) {
+    log(`ignoring "${installedJson}": "plugins" is not an object`);
+    return;
+  }
+  for (const versions of Object.values(plugins)) {
+    if (!Array.isArray(versions)) {
+      log(`ignoring entry in "${installedJson}": plugin versions are not an array`);
+      continue;
+    }
     for (const plugin of versions) {
-      if (plugin.installPath) {
-        const pkg = packageFromDir(plugin.installPath, "claude", trusted);
-        if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+      if (!isPlainObject(plugin)) {
+        log(`ignoring entry in "${installedJson}": entry is not an object`);
+        continue;
       }
+      const installPath = plugin.installPath;
+      if (typeof installPath !== "string") {
+        log(`ignoring entry in "${installedJson}": "installPath" is not a string`);
+        continue;
+      }
+      const pkg = packageFromDir(installPath, "claude", trusted);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }

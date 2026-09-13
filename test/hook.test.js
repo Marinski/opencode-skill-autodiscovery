@@ -2,7 +2,7 @@ import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import plugin from "../dist/index.js";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -309,6 +309,39 @@ test("config hook: no plugin-data directory without flags or with an unparseable
   );
   await runHook({ scanNodeModules: true, mcp: true });
   assert.equal(existsSync(pluginDataRoot), false, "no plugin-data root for unparseable mcp.json");
+});
+
+test("config hook: a corrupt Claude/VS Code manifest cannot abort the merge", async () => {
+  // A valid package that must still be registered even though both manifest
+  // sources are malformed.
+  makePackage(join(envRoot, "node_modules", "survivor"), "survivor", ["alive"]);
+
+  // Corrupt Claude manifest in the home-scoped location collectClaude reads.
+  const claudeManifest = join(envRoot, ".claude", "plugins", "installed_plugins.json");
+  mkdirSync(dirname(claudeManifest), { recursive: true });
+  writeFileSync(claudeManifest, JSON.stringify({ plugins: { a: {} } }));
+
+  // Corrupt VS Code manifest under a built-in home root.
+  const vscodeManifest = join(envRoot, ".vscode", "agent-plugins", "installed.json");
+  mkdirSync(dirname(vscodeManifest), { recursive: true });
+  writeFileSync(vscodeManifest, JSON.stringify({ installed: null }));
+
+  try {
+    const cfg = await runHook({ scanNodeModules: true });
+    assert.ok(
+      cfg.skills.paths.some((p) => p.includes("survivor")),
+      "valid package applied despite corrupt manifests",
+    );
+    assert.equal(
+      cfg.command.alive.template.includes('Load the "alive" skill'),
+      true,
+      "slash command from the valid package still registered",
+    );
+  } finally {
+    rmSync(join(envRoot, ".claude"), { recursive: true, force: true });
+    rmSync(join(envRoot, ".vscode"), { recursive: true, force: true });
+    rmSync(join(envRoot, "node_modules", "survivor"), { recursive: true, force: true });
+  }
 });
 
 test("config hook: non-string extraRoots/exclude entries are filtered per-entry", async () => {

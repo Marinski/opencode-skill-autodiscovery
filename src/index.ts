@@ -10,6 +10,7 @@ import {
   planConfig,
 } from "./discovery.js";
 import type { PluginPackage } from "./discovery.js";
+import { log } from "./log.js";
 
 type ConfigWithSkills = Config & {
   skills?: {
@@ -27,6 +28,19 @@ function isStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
+// Each collector is a best-effort probe of manifest- or filesystem-derived
+// state. The individual collectors already fail closed on malformed manifests,
+// so this is a backstop: a source that still throws is logged by name and the
+// merge continues with the packages collected so far.
+function collectSafely(source: string, collect: () => void): void {
+  try {
+    collect();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    log(`collector "${source}" failed: ${detail}`);
+  }
+}
+
 export default (async (_input, options) => {
   return {
     config: async (cfg: Config) => {
@@ -39,13 +53,17 @@ export default (async (_input, options) => {
       const exclude = isStringArray(options?.exclude);
 
       const packages: PluginPackage[] = [];
-      collectClaude(packages, exclude);
-      collectVscode(packages, extra, exclude);
+      collectSafely("claude", () => collectClaude(packages, exclude));
+      collectSafely("vscode", () => collectVscode(packages, extra, exclude));
       if (scanCache) {
-        collectOpencodeCache(join(opencodeCacheRoot(), "packages"), packages, exclude);
+        collectSafely("opencode-cache", () =>
+          collectOpencodeCache(join(opencodeCacheRoot(), "packages"), packages, exclude),
+        );
       }
       if (scanNodeModules) {
-        collectNodeModules(join(process.cwd(), "node_modules"), packages, false, exclude);
+        collectSafely("node_modules", () =>
+          collectNodeModules(join(process.cwd(), "node_modules"), packages, false, exclude),
+        );
       }
 
       const plan = planConfig(
