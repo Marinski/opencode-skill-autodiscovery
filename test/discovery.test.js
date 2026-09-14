@@ -29,6 +29,7 @@ import {
   readMcp,
   readPackage,
 } from "../dist/discovery.js";
+import { fingerprintTree, getCachedPackages } from "../dist/discovery-cache.js";
 import { sanitize } from "../dist/log.js";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -873,7 +874,7 @@ test("readMcp: maps stdio, expands placeholders, injects PLUGIN_ROOT/PLUGIN_DATA
         PLUGIN_ROOT: pkgDir,
         PLUGIN_DATA: dataDir,
       },
-      enabled: true,
+      enabled: false,
     });
   } finally {
     cleanup(root);
@@ -901,7 +902,7 @@ test("readMcp: maps streamable-http to remote and skips sse/unknowns", () => {
       type: "remote",
       url: "https://api.example.com/mcp",
       headers: {},
-      enabled: true,
+      enabled: false,
     });
   } finally {
     cleanup(root);
@@ -1049,7 +1050,7 @@ test("planConfig: namespaces MCP collisions across distinct sources", () => {
     };
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "opencode-cache");
-    const plan = planConfig([a, b]);
+    const plan = planConfig([a, b], {}, {}, { mcp: ["alpha", "beta"] });
     assert.deepEqual(
       plan.mcp.map((m) => m.key).sort(),
       ["beta/shared", "shared"],
@@ -1068,7 +1069,7 @@ test("planConfig: same-source MCP mirrors are not duplicated", () => {
     };
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const b = readPackage(makePackage(join(root, "b"), "beta", [], mcp), "node_modules");
-    const plan = planConfig([a, b]);
+    const plan = planConfig([a, b], {}, {}, { mcp: ["alpha", "beta"] });
     assert.deepEqual(plan.mcp.map((m) => m.key), ["shared"]);
   } finally {
     cleanup(root);
@@ -1079,8 +1080,10 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
   const root = makeTemp();
   try {
     // stdio entries are the strongest probe for invocation: readMcp's stdio
-    // branch mkdirs the package's plugin-data dir as a side effect, and ESM
-    // bindings can't be monkey-patched with a literal spy.
+    // branch is the path that plans a server, ESM bindings can't be
+    // monkey-patched with a literal spy, and planning never writes the
+    // package's plugin-data dir (only applying an opted-in server does), so
+    // the planned entries themselves are the invocation probe.
     const mcp = {
       $schema: MCP_SCHEMA_URL,
       mcpServers: {
@@ -1090,10 +1093,12 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
     const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
     const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
 
-    // Enabled: readMcp runs — entry planned, side effect performed.
-    const on = planConfig([a], {}, { mcp: true });
+    // Enabled: readMcp runs — entry planned. Unlike the disabled probe
+    // below, this package is untrusted, so it needs an explicit consent
+    // entry to be admitted through the trust gate.
+    const on = planConfig([a], {}, { mcp: true }, { mcp: ["alpha"] });
     assert.deepEqual(on.mcp.map((m) => m.key), ["srv"]);
-    assert.equal(existsSync(dataDir), true);
+    assert.equal(existsSync(dataDir), false);
 
     // Disabled: readMcp must not be invoked at all — nothing planned, no
     // filesystem side effects (dir removed first so absence proves it).
@@ -1101,6 +1106,38 @@ test("planConfig: skips readMcp entirely when the mcp flag is false", () => {
     const off = planConfig([a], {}, { mcp: false });
     assert.deepEqual(off.mcp, []);
     assert.equal(existsSync(dataDir), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig/applyConfigPatch: planning writes no package mcp data dir; applying an opted-in server does", () => {
+  const root = makeTemp();
+  try {
+    const mcp = {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "stdio", command: "npx", args: ["-y", "server"] },
+      },
+    };
+    const a = readPackage(makePackage(join(root, "a"), "alpha", [], mcp), "node_modules");
+    const dataDir = join(stateDir, "opencode", "plugin-data", "alpha");
+    // Pre-existing dirs are removed so any creation below is provably ours;
+    // the untrusted fixture package needs explicit consent to be admitted.
+    rmSync(dataDir, { recursive: true, force: true });
+
+    // Planning alone (even with the server planned and mcp opted in) must
+    // not create the package's data directory.
+    const plan = planConfig([a], {}, { mcp: true }, { mcp: ["alpha"] });
+    assert.deepEqual(plan.mcp.map((m) => m.key), ["srv"]);
+    assert.equal(existsSync(dataDir), false);
+
+    // Applying the plan with mcp opted in registers the server and only at
+    // that point creates its data directory.
+    const cfg = {};
+    applyConfigPatch(cfg, plan, { mcp: true, agents: false });
+    assert.deepEqual(Object.keys(cfg.mcp), ["srv"]);
+    assert.equal(existsSync(dataDir), true);
   } finally {
     cleanup(root);
   }
@@ -1131,8 +1168,9 @@ test("planConfig: skips readAgents entirely when the agents flag is false", () =
     );
     const a = readPackage(pkgDir, "node_modules");
 
-    // Enabled: readAgents runs — agent planned.
-    const on = planConfig([a], {}, { agents: true });
+    // Enabled: readAgents runs — agent planned, but admission needs the
+    // package's consent: alpha is an untrusted node_modules package.
+    const on = planConfig([a], {}, { agents: true }, { agents: ["alpha"] });
     assert.deepEqual(on.agents.map((x) => x.name), ["reviewer"]);
 
     // Disabled: readAgents must not be invoked at all — nothing planned.
@@ -1185,6 +1223,371 @@ test("readMcp: rejects non-http(s) urls for remote transports", () => {
   }
 });
 
+test("readMcp: rejects an http:// streamable-http url (even with headers) and leaves config.mcp clean", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (a): a streamable-http entry carrying an Authorization header
+    // and an http:// url must be rejected by the shared https gate - the
+    // header would otherwise ship in cleartext.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        insecure: {
+          type: "streamable-http",
+          url: "http://api.example.com/mcp",
+          headers: { Authorization: "Bearer secret" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) around the readMcp run.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // No mirrored entry for the http:// server...
+    assert.equal(out.length, 0);
+    // ...and exactly one loud line naming package, server, and reason.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /skipping MCP server "pkg\/insecure"/);
+    assert.match(logs[0], /remote servers must use https/);
+    // config.mcp stays empty after patching.
+    const cfg = {};
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { mcp: ["pkg"] }), {
+      mcp: true,
+      agents: false,
+    });
+    assert.equal(cfg.mcp, undefined);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: warns (does not strip) when a remote entry declares an Authorization-style header", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (b): an https url plus an Authorization header is mirrored
+    // as-is but warned - opencode stores config.mcp in plaintext.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // The entry still registers with the header intact (warn, don't strip)...
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, "authed");
+    assert.deepEqual(out[0].entry.headers, { Authorization: "Bearer sekrit" });
+    // ...and exactly one loud line names package, server, and the risk.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /MCP server "pkg\/authed"/);
+    assert.match(logs[0], /Authorization-style header/);
+    assert.match(logs[0], /stored in opencode's config in plaintext/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: warns when a remote url carries an userinfo@ component", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (c): user:pass@ in the url is a credential and gets the same
+    // warn-but-keep treatment.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        userinfo: {
+          type: "streamable-http",
+          url: "https://user:pass@api.example.com/mcp",
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // The entry still registers with the url intact (warn, don't strip)...
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, "userinfo");
+    assert.equal(out[0].entry.url, "https://user:pass@api.example.com/mcp");
+    // ...and exactly one loud line names package, server, and the risk.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /MCP server "pkg\/userinfo"/);
+    assert.match(logs[0], /userinfo@/);
+    assert.match(logs[0], /stored in opencode's config in plaintext/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig: credential-bearing MCP entries from untrusted packages are skipped by default with a named line and admitted by consent", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (d): a streamable-http entry carrying an Authorization header
+    // from an untrusted package is refused by the trust gate with a named
+    // line, and admitted only when the package is consented.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Without consent the entry is refused with exactly one named line
+    // naming the server and the credential reason.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let off;
+    try {
+      off = planConfig([pkg], {}, { mcp: true });
+    } finally {
+      console.error = origError;
+    }
+    assert.equal(off.mcp.length, 0);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /skipping MCP server "pkg\/authed"/);
+    assert.match(logs[0], /Authorization-style header/);
+    assert.match(logs[0], /consent\.mcp/);
+
+    // With the package in consent.mcp the same entry registers. Its
+    // plaintext warning fires on the admitted run (warn is on by default).
+    const on = planConfig([pkg], {}, { mcp: true }, { mcp: ["pkg"] });
+    assert.deepEqual(on.mcp.map((m) => m.key), ["authed"]);
+    assert.deepEqual(on.mcp[0].entry.headers, { Authorization: "Bearer sekrit" });
+    assert.equal(on.mcp[0].trusted, false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: credential-free entries produce no warning", () => {
+  const root = makeTemp();
+  try {
+    // Fixture (e): benign headers, env values, and urls must not warn.
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        remote: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Accept: "application/json", "X-Trace-Id": "abc123" },
+        },
+        local: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "server"],
+          env: { MODE: "production", REGION: "eu" },
+        },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    // Both entries register and nothing is warned about.
+    assert.equal(out.length, 2);
+    assert.deepEqual(out.map((e) => e.key).sort(), ["local", "remote"]);
+    assert.equal(logs.length, 0);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("reject-warn-consent matrix runs together end to end: http rejected, credentials warn per package/server, untrusted gated on consent, clean entries silent", () => {
+  const root = makeTemp();
+  try {
+    // One fixture package carrying every matrix cell at once, so the cells
+    // are exercised together the way a real discovered package would be:
+    //   (a) insecure    - http:// url with Authorization -> rejected, never lands
+    //   (b) authed      - https + Authorization header   -> warns, registers
+    //   (c) userinfo    - https://user:pass@ url         -> warns, registers
+    //   (e) cleanremote - https, benign header           -> silent, registers
+    //   (e) localsecret - stdio env with credential value -> warns, registers
+    //   (e) localclean  - stdio env without credentials   -> silent, registers
+    const pkgDir = makePackage(root, "matrixpkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        insecure: {
+          type: "streamable-http",
+          url: "http://api.example.com/mcp",
+          headers: { Authorization: "Bearer secret" },
+        },
+        authed: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer sekrit" },
+        },
+        userinfo: {
+          type: "streamable-http",
+          url: "https://user:pass@api.example.com/mcp",
+        },
+        cleanremote: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { Accept: "application/json" },
+        },
+        localsecret: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "srv"],
+          env: { API_TOKEN: "s3cr3t-bearer-value" },
+        },
+        localclean: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "srv"],
+          env: { MODE: "production" },
+        },
+      },
+    });
+    const untrusted = readPackage(pkgDir, "node_modules");
+    const trusted = readPackage(pkgDir, "claude", true);
+    const dataDir = join(stateDir, "opencode", "plugin-data", "matrixpkg");
+
+    // Frames planConfig with console.error captured so the rejections and
+    // plaintext warnings are observed exactly as the user would see them -
+    // during planning, before any entry lands in config.
+    function planned(pkgs, consent) {
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      let plan;
+      try {
+        plan = planConfig(pkgs, {}, { mcp: true }, consent);
+      } finally {
+        console.error = origError;
+      }
+      return { plan, logs };
+    }
+
+    // (d) without consent: every server of the untrusted package is refused.
+    // Each credential-bearing entry gets its own named per-server line, the
+    // http:// entry gets the https rejection, and nothing is planned.
+    rmSync(dataDir, { recursive: true, force: true });
+    const off = planned([untrusted], {});
+    assert.deepEqual(off.plan.mcp, []);
+    assert.deepEqual(
+      off.logs.map((l) => l.replace("[opencode-skill-autodiscovery] ", "")).sort(),
+      [
+        'skipping MCP server "matrixpkg/authed" (node_modules): declares an Authorization-style header; add it to consent.mcp to admit its servers',
+        'skipping MCP server "matrixpkg/insecure": remote servers must use https',
+        'skipping MCP server "matrixpkg/localsecret" (node_modules): declares a credential-looking env value; add it to consent.mcp to admit its servers',
+        'skipping MCP server "matrixpkg/userinfo" (node_modules): carries an userinfo@ component; add it to consent.mcp to admit its servers',
+      ],
+    );
+    assert.equal(existsSync(dataDir), false, "planning writes no package data dir");
+
+    // (d) with consent: the untrusted package's servers are admitted. Every
+    // credential-bearing entry warns at plan time - naming package and server
+    // - before the entries land in config. The http:// entry still never
+    // transits, and the credential-free entries stay silent.
+    rmSync(dataDir, { recursive: true, force: true });
+    const on = planned([untrusted], { mcp: ["matrixpkg"] });
+    assert.deepEqual(on.plan.mcp.map((m) => m.key).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    const onWarnings = on.logs.filter((l) => /will be stored in opencode's config in plaintext/.test(l));
+    assert.deepEqual(
+      onWarnings.map((l) => l.replace("[opencode-skill-autodiscovery] ", "")).sort(),
+      [
+        `MCP server "matrixpkg/authed" declares an Authorization-style header; it will be stored in opencode's config in plaintext`,
+        `MCP server "matrixpkg/localsecret" declares a credential-looking env value; it will be stored in opencode's config in plaintext`,
+        `MCP server "matrixpkg/userinfo" carries an userinfo@ component; it will be stored in opencode's config in plaintext`,
+      ],
+    );
+    // (a) the http:// host is rejected with a named warning in the same run.
+    assert.equal(on.logs.some((l) => /skipping MCP server "matrixpkg\/insecure": remote servers must use https/.test(l)), true);
+    // (e) no warning names a credential-free server.
+    assert.equal(on.logs.some((l) => /cleanremote|localclean/.test(l)), false);
+    assert.equal(existsSync(dataDir), false, "planning still writes no package data dir");
+
+    const cfg = {};
+    applyConfigPatch(cfg, on.plan, { mcp: true, agents: false });
+    assert.deepEqual(Object.keys(cfg.mcp).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    assert.equal(cfg.mcp.insecure, undefined, "no package-declared entry can transit http://");
+    assert.deepEqual(cfg.mcp.authed.headers, { Authorization: "Bearer sekrit" });
+    assert.equal(cfg.mcp.userinfo.url, "https://user:pass@api.example.com/mcp");
+    // Applying the opted-in stdio servers is the only point a data dir appears.
+    assert.equal(existsSync(dataDir), true);
+
+    // Trusted packages need no consent: identical admission and warnings.
+    rmSync(dataDir, { recursive: true, force: true });
+    const tr = planned([trusted], {});
+    assert.deepEqual(tr.plan.mcp.map((m) => m.key).sort(), [
+      "authed",
+      "cleanremote",
+      "localclean",
+      "localsecret",
+      "userinfo",
+    ]);
+    const trWarnings = tr.logs.filter((l) => /will be stored in opencode's config in plaintext/.test(l));
+    assert.equal(trWarnings.length, 3);
+    assert.equal(tr.logs.some((l) => /skipping MCP server "matrixpkg\/insecure": remote servers must use https/.test(l)), true);
+    assert.equal(tr.logs.some((l) => /cleanremote|localclean/.test(l)), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("readMcp: __proto__ and constructor server keys are skipped loudly and leave config.mcp clean", () => {
   const root = makeTemp();
   try {
@@ -1228,7 +1631,10 @@ test("readMcp: __proto__ and constructor server keys are skipped loudly and leav
     // server, Object.prototype is untouched, and the container itself is
     // prototype-free (built via Object.create(null)).
     const cfg = {};
-    applyConfigPatch(cfg, planConfig([pkg]), { mcp: true, agents: false });
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { mcp: ["pkg"] }), {
+      mcp: true,
+      agents: false,
+    });
     assert.deepEqual(Object.keys(cfg.mcp), ["good"]);
     assert.equal(Object.getPrototypeOf(cfg.mcp), null);
   } finally {
@@ -1310,6 +1716,19 @@ test("collectClaude: walks hash-named remote plugin dirs for flat agents and ski
       const agents = readAgents(pkg);
       assert.equal(agents.length, 1);
       assert.equal(agents[0].name, "engineering-code-reviewer");
+
+      // Regression guard for the original reported bug: this remote walk
+      // (the exact code path that scans ~/.claude/remote/plugins) must go
+      // through findPluginPackagesCached, not a bare findPluginRoots call,
+      // or a large synced marketplace re-walks and re-reads every file on
+      // every single opencode launch. Verify the whole-root cache actually
+      // recorded this scan under the "claude" source, keyed on the remote
+      // root — not just that discovery itself is correct.
+      const fingerprint = fingerprintTree(remote);
+      const cached = getCachedPackages(JSON.stringify(["claude", remote]), fingerprint);
+      assert.ok(cached, "collectClaude's remote walk populates the whole-root cache");
+      assert.equal(cached.length, 1);
+      assert.equal(cached[0].name, pkg.name);
     } finally {
       if (oldHome === undefined) delete process.env.HOME;
       else process.env.HOME = oldHome;
@@ -1647,9 +2066,12 @@ test("planConfig: an extra-root package still needs the mcp opt-in to contribute
     // The trust tier never substitutes for the explicit opt-in: without it no
     // servers are planned...
     assert.deepEqual(planConfig([pkg], {}, { mcp: false }).mcp, []);
-    // ...and only with it does the package contribute.
+    // ...the opt-in alone isn't enough either, since the package is untrusted
+    // and nothing has consented to it...
+    assert.deepEqual(planConfig([pkg], {}, { mcp: true }).mcp, []);
+    // ...only the opt-in plus per-package consent admits it.
     assert.deepEqual(
-      planConfig([pkg], {}, { mcp: true }).mcp.map((m) => m.key),
+      planConfig([pkg], {}, { mcp: true }, { mcp: ["extra-pkg"] }).mcp.map((m) => m.key),
       ["planted"],
     );
   } finally {
@@ -1839,6 +2261,62 @@ test("readAgents: reads dev.opencode manifest agents and strips permission", () 
       prompt: "You review code",
       mode: "subagent",
     });
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: clamps package-supplied mode and tools to the conservative default", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "pkg",
+        extensions: {
+          "dev.opencode": {
+            agents: {
+              reviewer: {
+                description: "Reviews diffs",
+                prompt: "You review code",
+                mode: "primary",
+                tools: { bash: true, write: true },
+              },
+            },
+          },
+        },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    // Capture log() output (console.error) so the named drops can be asserted.
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    // Declared capability is never inherited: mode: "primary" clamps to
+    // "subagent" and tools booleans are dropped entirely.
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "reviewer");
+    assert.deepEqual(agents[0].agent, {
+      description: "Reviews diffs",
+      prompt: "You review code",
+      mode: "subagent",
+    });
+    assert.equal(logs.length, 2, "mode drop + tools drop logged");
+    for (const line of logs) {
+      assert.match(line, /agent "reviewer"/);
+      assert.match(line, /package "pkg"/);
+    }
   } finally {
     cleanup(root);
   }
@@ -2353,7 +2831,10 @@ test("readAgents: __proto__ and constructor manifest agent keys are skipped loud
     // entry, Object.prototype is untouched, and the container itself is
     // prototype-free (built via Object.create(null)).
     const cfg = {};
-    applyConfigPatch(cfg, planConfig([pkg]), { mcp: false, agents: true });
+    applyConfigPatch(cfg, planConfig([pkg], {}, {}, { agents: ["pkg"] }), {
+      mcp: false,
+      agents: true,
+    });
     assert.deepEqual(Object.keys(cfg.agent), ["good"]);
     assert.equal(Object.getPrototypeOf(cfg.agent), null);
   } finally {
@@ -2499,7 +2980,9 @@ test("planConfig: namespaces agent collisions across distinct sources", () => {
     );
     const a = readPackage(aDir, "node_modules");
     const b = readPackage(bDir, "opencode-cache");
-    const plan = planConfig([a, b]);
+    // Test fixtures build packages untrusted by default (the collectors mark
+    // sources trusted in production), so both need consent to be admitted.
+    const plan = planConfig([a, b], {}, {}, { agents: ["alpha", "beta"] });
     assert.deepEqual(
       plan.agents.map((x) => x.name).sort(),
       ["beta-reviewer", "reviewer"],
@@ -2525,7 +3008,9 @@ test("planConfig: same-source agent mirrors are not duplicated", () => {
     writeFileSync(join(bDir, "plugin.json"), JSON.stringify(manifest("beta")));
     const a = readPackage(aDir, "node_modules");
     const b = readPackage(bDir, "node_modules");
-    const plan = planConfig([a, b]);
+    // Both same-source mirrors are untrusted: each needs consent for its
+    // agents to be admitted.
+    const plan = planConfig([a, b], {}, {}, { agents: ["alpha", "beta"] });
     assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
   } finally {
     cleanup(root);
@@ -2553,11 +3038,63 @@ test("planConfig: collapses the same conformant package across sources", () => {
     build(nmDir);
     const cache = readPackage(cacheDir, "opencode-cache");
     const nm = readPackage(nmDir, "node_modules");
-    const plan = planConfig([cache, nm]);
-    // Same package name across sources: one agent, one skill path, one command.
+    // Same package name across sources: one agent, one skill path, one
+    // command. The surviving deduplicated copy is first (the cache one), and
+    // test fixtures are untrusted, so consent admits it by name.
+    const plan = planConfig([cache, nm], {}, {}, { agents: ["dotest"] });
     assert.deepEqual(plan.agents.map((x) => x.name), ["reviewer"]);
     assert.equal(plan.skillPaths.length, 1);
     assert.deepEqual(plan.commands.map((c) => c.name), ["s"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("planConfig: untrusted packages still register skills and commands, with one info log line each; trusted packages log nothing", () => {
+  const root = makeTemp();
+  try {
+    // The permissive half of the graduated default: skills and slash commands
+    // are read-only content registration, so trust never blocks them. An
+    // untrusted package registers exactly like a trusted one, but emits one
+    // info line naming the package and its source so side-effect content
+    // entering the session stays visible. Test fixtures build packages
+    // untrusted by default; the trusted one is vouched for explicitly.
+    const untrusted = readPackage(
+      makePackage(join(root, "alpha"), "alpha", ["spec", "extra"]),
+      "node_modules",
+    );
+    const trusted = readPackage(
+      makePackage(join(root, "beta"), "beta", ["spec"]),
+      "opencode-cache",
+      true,
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let plan;
+    try {
+      plan = planConfig([trusted, untrusted]);
+    } finally {
+      console.error = origError;
+    }
+
+    // Both tiers register the same content: a skill path per skill dir and a
+    // slash command per valid frontmatter name, collisions namespaced.
+    assert.equal(plan.skillPaths.length, 3);
+    assert.deepEqual(plan.commands.map((c) => c.name).sort(), [
+      "alpha-spec",
+      "extra",
+      "spec",
+    ]);
+    // Only the untrusted package logged, exactly one info line naming it and
+    // its source; the trusted package keeps current (silent) behavior.
+    assert.equal(logs.length, 1);
+    assert.match(
+      logs[0],
+      /registering skills and slash commands for untrusted package "alpha"/,
+    );
+    assert.match(logs[0], /node_modules/);
   } finally {
     cleanup(root);
   }
@@ -2705,9 +3242,12 @@ test("planConfig: hostile SKILL.md frontmatter names are skipped loudly and leav
     // Skipped entries: the hostile frontmatter names become no command...
     assert.deepEqual(plan.commands.map((c) => c.name), ["good"]);
     // ...and each rejection emitted exactly one loud line naming the
-    // package, the source ('skill frontmatter'), and a reason.
-    assert.equal(logs.length, badNames.length);
-    for (const line of logs) {
+    // package, the source ('skill frontmatter'), and a reason. (The
+    // fixture package is untrusted, so its skills also register with the
+    // graduated-default info line; only the rejection lines are counted.)
+    const hostileLogs = logs.filter((line) => line.includes("invalid name"));
+    assert.equal(hostileLogs.length, badNames.length);
+    for (const line of hostileLogs) {
       assert.match(line, /package "pkg"/);
       assert.match(line, /skill frontmatter/);
       assert.match(line, /invalid name/);

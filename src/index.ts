@@ -43,6 +43,35 @@ function collectSafely(source: string, collect: () => void): void {
   }
 }
 
+// Per-package consent option: package names whose MCP servers / agents are
+// wanted even when the package is discovered as untrusted. Complements
+// `exclude` (the deny side) and the global `mcp` / `agents` switches (the
+// coarse on-switch); consent refines it for untrusted packages.
+export type ConsentMap = {
+  mcp: string[];
+  agents: string[];
+};
+
+function isAllStrings(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+// Normalizes the `consent` option. Unlike isStringArray above, a malformed
+// list degrades the *whole* map entry to [] rather than filtering per-entry:
+// consent is an allow-list for otherwise-untrusted package content, so a
+// half-valid entry (e.g. one non-string item) should not partially admit it.
+// Any malformed shape is identical to the option being absent.
+export function parseConsent(raw: unknown): ConsentMap {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { mcp: [], agents: [] };
+  }
+  const consent = raw as Record<string, unknown>;
+  return {
+    mcp: isAllStrings(consent.mcp) ? consent.mcp : [],
+    agents: isAllStrings(consent.agents) ? consent.agents : [],
+  };
+}
+
 export default (async (_input, options) => {
   return {
     config: async (cfg: Config) => {
@@ -53,6 +82,11 @@ export default (async (_input, options) => {
       const mcpEnabled = options?.mcp === true;
       const agentsEnabled = options?.agents === true;
       const exclude = isStringArray(options?.exclude);
+      // Consent refines the mcp switch for untrusted packages: consent.mcp
+      // admits a package's servers by name when mcp:true is on. Agents
+      // consent is parsed and carried for the same gate; nothing here makes
+      // an untrusted package register without its switch on.
+      const consent = parseConsent(options?.consent);
 
       const packages: PluginPackage[] = [];
       collectSafely("claude", () => collectClaude(packages, exclude));
@@ -76,6 +110,7 @@ export default (async (_input, options) => {
           agents: Object.keys(config.agent ?? {}),
         },
         { mcp: mcpEnabled, agents: agentsEnabled },
+        { mcp: consent.mcp, agents: consent.agents },
       );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });

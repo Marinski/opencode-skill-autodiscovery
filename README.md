@@ -62,6 +62,35 @@ and both variables are injected into each stdio server's environment
 per-entry, never fatally. `sse` servers and stdio `cwd` (which opencode cannot
 represent) are dropped with a log line.
 
+### MCP credentials
+
+Package-declared `mcp.json` servers are mirrored **verbatim** into your
+opencode config: `headers`, `env` values, and server `url`s are copied exactly
+as written (modulo `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` expansion) into
+`config.mcp.<server>`. opencode stores `config.mcp` in plaintext, so any
+credential in those fields — an `Authorization` header, a token in `env`, an
+`userinfo@` URL — is plaintext-at-rest and may appear in host config backups,
+logs, or terminal output. Treat a server's headers/env/URL as a static
+snapshot: once mirrored, the value has no rotation or revocation linkage back
+to the package — updating the package does not rotate a copied token.
+
+Guidance:
+
+- **Use https-only remotes.** `streamable-http` servers must already be
+  `https://` to register (a plain `http://` URL would ship any `headers` in
+  cleartext), and that is the transport you want when a server carries
+  credentials.
+- **Audit `config.mcp`** after discovery to confirm which servers and
+  credential fields entered your config, and remove anything you did not
+  intend to persist.
+- **Use `consent` / `exclude`** to control admission: servers from untrusted
+  packages are skipped until the package is listed under `consent.mcp`, and
+  `exclude` drops a package entirely.
+- The planning-time `mkdir` for a package stdio server's `PLUGIN_DATA`
+  directory is deferred: the directory is created only when the server is
+  actually applied to the config, never at plan time — so a
+  discovered-but-unapplied server leaves no filesystem trace.
+
 ### Agents (opt-in)
 
 Agent Plugins 1.0.0 has no portable "agents" component type (only skills and
@@ -87,9 +116,11 @@ Discovered agents are registered as `config.agent.<name>` with the same rules
 as commands: user-defined agents are never overwritten, same-source mirrors are
 collapsed, and cross-source collisions become `<package>-<agent>`.
 
-**Trust note:** a package-supplied `permission` block is always dropped — agent
-permissions are too powerful to inherit from a package by default. If you need
-one, define the agent yourself in `opencode.json` (which always wins).
+**Trust note:** package-supplied capability is clamped to the conservative
+default: `permission` blocks and `tools` grants are always dropped, and any
+declared `mode` other than `subagent` clamps to `subagent`. Each drop is logged
+naming the package and the agent. If you need more, define the agent yourself
+in `opencode.json` (which always wins).
 
 ### Slash commands
 
@@ -150,6 +181,7 @@ Use the tuple form to configure options:
 | `exclude` | `[]` | Package names to skip during discovery, regardless of trust tier. Matches the conformant package's `plugin.json` name, or the directory basename when there is no manifest. |
 | `mcp` | `false` | Also register MCP servers from discovered packages' `mcp.json`. |
 | `agents` | `false` | Also register agents from packages (see "Agents" above). |
+| `consent` | `{}` | Per-package consent map: `consent.mcp` / `consent.agents` list package names whose MCP servers / agents are wanted even when the package is discovered as untrusted. Refines the `mcp` / `agents` switches; `exclude` remains the deny side. |
 
 Both scan flags default to `false` for supply-chain reasons: a discovered
 skill's `SKILL.md` becomes prompt material in your sessions, so anything that
@@ -187,23 +219,46 @@ deliberately, vouched for by a manifest:
   still reference a global extension directory).
 - manifest-less directory walks (e.g. cloned-but-uninstalled marketplace folders).
 
-Trust decides whether content gets *registered*, not whether it is safe: a
-registered skill's `SKILL.md` becomes prompt material in your sessions. The
-`$schema` check identifies format only — never provenance or safety. Any package
-can copy the literal schema URL, so a conformant manifest proves nothing about
-who wrote it.
+### Graduated default
 
-### `mcp` and `agents` trust everything they find
+Trust gates the two component tiers differently:
 
-Both flags are single global switches: enabling one trusts **every** discovered
-package that ships the matching config. There is no per-package consent step.
+- **Skills and slash commands register for every tier.** Both are read-only
+  content registration — surfacing a package's skills is the plugin's job, so
+  trust never blocks them. An untrusted package's skills and commands are
+  registered exactly like a trusted one's, but each untrusted package emits a
+  one-line info log naming the package and its source, so side-effect content
+  entering the session stays visible. `exclude` remains the deny side.
+- **MCP servers and agents are default-off for untrusted packages.** The
+  `mcp` / `agents` switches admit servers and agents from trusted packages
+  directly; an untrusted package contributes them only when the package is
+  listed under `consent.mcp` / `consent.agents`.
 
-- `mcp: true` registers every conformant package's `mcp.json`; stdio entries
-  execute commands on your machine.
-- `agents: true` registers package-supplied agents essentially verbatim within
-  the schema: a package can set `mode: "primary"` (making itself a primary
-  agent) and arbitrary `tools` booleans such as `"write": true`. Only
-  `permission` blocks are dropped.
+Trust never decides whether content is *safe*: a registered skill's
+`SKILL.md` becomes prompt material in your sessions. The `$schema` check
+identifies format only — never provenance or safety. Any package can copy the
+literal schema URL, so a conformant manifest proves nothing about who wrote it.
+
+### `mcp` and `agents` register package content
+
+Both flags are global opt-in switches, narrowed by `exclude` and refined by
+per-package `consent` (below). Trust decides admission: `mcp: true` /
+`agents: true` admit servers or agents from trusted packages, and from
+untrusted packages only when the package is listed under `consent.mcp` /
+`consent.agents`.
+
+- `mcp: true` admits MCP servers from packages that are trusted or listed in
+  `consent.mcp`. Every registered package-supplied server starts with
+  `enabled: false`: opencode will not spawn a package-declared binary or
+  connect to a package-chosen endpoint at startup on discovery alone.
+  Admittance is opt-in; the safe default is off.
+- `agents: true` admits agents from packages that are trusted or listed in
+  `consent.agents`, then clamps each to the conservative default: a declared
+  `mode` other than `subagent` is dropped (a package cannot make itself a
+  primary agent), `tools` booleans such as `"write": true` are never
+  inherited, and `permission` blocks are dropped — each drop is logged naming
+  the package and the agent. An agent without an explicit `mode` still falls
+  through to opencode's `all` default.
 
 Pair these flags with `exclude` to carve out packages you do not want
 registered:
@@ -216,10 +271,44 @@ registered:
 }
 ```
 
-Residual risk, stated plainly: approving or rejecting an individual package's
-MCP servers or agents would require an interactive consent surface, which
-opencode's synchronous `config` hook cannot provide. The granularity available
-today is all-or-nothing per component type, narrowed by `exclude`.
+### Per-package consent (`consent`)
+
+Consent is the per-package allow side for packages discovered as **untrusted**
+(the project's `node_modules`, user-supplied `extraRoots`, manifest-less
+walks). List a package's name under `consent.mcp` to admit its MCP servers, or
+under `consent.agents` to admit its agents, even though the package is not
+trusted by default:
+
+```json
+{
+  "plugin": [
+    [
+      "opencode-skill-autodiscovery",
+      {
+        "scanNodeModules": true,
+        "mcp": true,
+        "agents": true,
+        "consent": {
+          "mcp": ["community-tools"],
+          "agents": ["community-tools"]
+        }
+      }
+    ]
+  ]
+}
+```
+
+- `consent` only refines the coarse switches: `mcp: true` / `agents: true`
+  stay the on-switch, and `consent.mcp` / `consent.agents` list which
+  untrusted packages are admitted when a switch is on.
+- `exclude` remains the deny side and wins: a package listed in both
+  `exclude` and `consent` is never discovered.
+- Trusted packages need no consent entry.
+- The default — no `consent` option — grants nothing extra: untrusted
+  packages contribute no MCP servers or agents until admitted by name.
+
+Consent is declarative (package names in `opencode.json`), so it works inside
+opencode's synchronous `config` hook — no interactive prompt required.
 
 ### Identifier rules
 

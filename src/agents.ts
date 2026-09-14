@@ -126,9 +126,12 @@ function readContainedJson(root: string, path: string): unknown {
 }
 
 // Converts a raw, package-supplied agent object into an opencode AgentConfig.
-// `permission` blocks are dropped (too powerful to inherit by default) and
-// unknown/mistyped keys are ignored. Returns null when nothing usable is left.
-function toAgentConfig(raw: unknown): AgentConfig | null {
+// Package-supplied capability is deliberately clamped: any declared `mode`
+// other than the conservative "subagent" default is dropped, and `permission`
+// blocks and `tools` grants are never inherited (both too powerful to inherit
+// by default). Each drop is logged naming the package and the agent. Unknown
+// or mistyped keys are ignored. Returns null when nothing usable is left.
+function toAgentConfig(raw: unknown, pkgName: string, agentName: string): AgentConfig | null {
   const src = asRecord(raw);
   if (!src) return null;
   const agent: AgentConfig = {};
@@ -155,19 +158,31 @@ function toAgentConfig(raw: unknown): AgentConfig | null {
   if (topP !== undefined) agent.top_p = topP;
   if (maxSteps !== undefined) agent.maxSteps = maxSteps;
   if (typeof src.disable === "boolean") agent.disable = src.disable;
+  // A declared mode other than "subagent" requests capabilities (a primary
+  // agent, or opencode's full "all" surface) that a package should not grant
+  // itself. Drop it and clamp to the conservative default. An unset mode
+  // falls through to opencode's own "all" default, so it stays unset.
   if (typeof src.mode === "string" && MODES.has(src.mode)) {
-    agent.mode = src.mode as AgentConfig["mode"];
-  }
-  const tools = asRecord(src.tools);
-  if (tools) {
-    const filtered: Record<string, boolean> = {};
-    for (const [name, value] of Object.entries(tools)) {
-      if (typeof value === "boolean") filtered[name] = value;
+    if (src.mode !== "subagent") {
+      log(
+        `dropping mode "${src.mode}" from agent "${agentName}" supplied by package "${pkgName}": clamping to conservative "subagent"`,
+      );
     }
-    agent.tools = filtered;
+    agent.mode = "subagent";
+  }
+  // Tools booleans are capability grants and are never inherited from a
+  // package (agent.tools is intentionally left unset). The drop is logged so
+  // a package cannot silently pretend it carries write access.
+  const tools = asRecord(src.tools);
+  if (tools && Object.values(tools).some((value) => typeof value === "boolean")) {
+    log(
+      `dropping tools from agent "${agentName}" supplied by package "${pkgName}": too powerful to inherit`,
+    );
   }
   if (src.permission !== undefined) {
-    log("dropping permission block from a package-supplied agent: too powerful to inherit");
+    log(
+      `dropping permission block from agent "${agentName}" supplied by package "${pkgName}": too powerful to inherit`,
+    );
   }
   if (!agent.description && !agent.prompt) return null;
   return agent;
@@ -219,7 +234,7 @@ function readAgentsUncached(pkg: PluginPackage): ReadAgentsResult {
         continue;
       }
       if (out.has(name)) continue;
-      const agent = toAgentConfig(raw);
+      const agent = toAgentConfig(raw, pkg.name, name);
       if (agent) out.set(name, agent);
     }
   }
@@ -243,7 +258,7 @@ function readAgentsUncached(pkg: PluginPackage): ReadAgentsResult {
       continue;
     }
     if (out.has(name)) continue;
-    const agent = toAgentConfig(readContainedJson(pkg.root, join(extDir, entry)));
+    const agent = toAgentConfig(readContainedJson(pkg.root, join(extDir, entry)), pkg.name, name);
     if (agent) out.set(name, agent);
   }
 

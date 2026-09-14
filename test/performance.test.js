@@ -63,7 +63,11 @@ after(() => {
 });
 
 test(`performance: a warm run over ${PACKAGE_COUNT * FILES_PER_PACKAGE} flat .md files stays fast, and discovers all of them either way`, async () => {
-  const hooks = await plugin({}, { extraRoots: ["market"], agents: true });
+  const consentedAgents = Array.from({ length: PACKAGE_COUNT }, (_, p) => `division-${p}`);
+  const hooks = await plugin(
+    {},
+    { extraRoots: ["market"], agents: true, consent: { agents: consentedAgents } },
+  );
 
   const cold = { skills: { paths: [] } };
   const coldStart = performance.now();
