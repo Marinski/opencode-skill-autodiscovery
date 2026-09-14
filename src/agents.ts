@@ -1,7 +1,10 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { cachedRead } from "./cache.js";
+import { fingerprintTree, getCachedValue, setCachedValue } from "./discovery-cache.js";
 import { log } from "./log.js";
 import { validateName } from "./schema.js";
+import { resolveContained } from "./discovery.js";
 import type { PluginPackage } from "./discovery.js";
 
 // opencode's config.agent shape (subset of the SDK's AgentConfig). Permission
@@ -110,6 +113,18 @@ function readJson(path: string): unknown {
   }
 }
 
+// Package-supplied JSON that feeds agent config (the plugin manifests and the
+// dev.opencode/agents/*.json extension files) is read only when it resolves
+// inside the package root. A symlinked manifest would otherwise let an outside
+// file's `description`/`prompt`/`systemPrompt` fields become model prompt
+// material. Missing files resolve to null silently; an escaping symlink is
+// logged once by resolveContained.
+function readContainedJson(root: string, path: string): unknown {
+  const contained = resolveContained(root, path);
+  if (!contained) return null;
+  return readJson(contained);
+}
+
 // Converts a raw, package-supplied agent object into an opencode AgentConfig.
 // Package-supplied capability is deliberately clamped: any declared `mode`
 // other than the conservative "subagent" default is dropped, and `permission`
@@ -173,18 +188,38 @@ function toAgentConfig(raw: unknown, pkgName: string, agentName: string): AgentC
   return agent;
 }
 
+type ReadAgentsResult = Array<{ name: string; agent: AgentConfig }>;
+
 // Discovers agents contributed by a package, in order:
 //   1. plugin.json `extensions["dev.opencode"].agents` (Agent Plugins 5.6)
 //   2. a `dev.opencode/agents/<name>.json` extension directory (Agent Plugins 8.2)
 //   3. a legacy Claude Code plugin shim: `.claude-plugin/plugin.json` `agents`
 //      plus `agents/<name>/AGENTS.md` when no systemPrompt is declared.
 // Returns a stable, de-duplicated list keyed by agent name.
-export function readAgents(
-  pkg: PluginPackage,
-): Array<{ name: string; agent: AgentConfig }> {
+//
+// Cached as a whole per package, fingerprinted on pkg.root: this function's
+// own per-file cachedRead calls (below) already skip re-parsing an unchanged
+// *file*, but still pay a readdirSync + containment check (2x realpathSync)
+// per candidate file on every call. A marketplace package that ships many
+// flat agent .md files directly in its root (the agency-agents layout) makes
+// that per-file overhead the dominant remaining cost even on an otherwise
+// fully warm run — skipping the whole function on an unchanged package root
+// avoids it entirely, the same way discovery-cache.ts's walk-skip avoids
+// re-walking an unchanged marketplace tree.
+export function readAgents(pkg: PluginPackage): ReadAgentsResult {
+  const fingerprint = fingerprintTree(pkg.root);
+  const key = JSON.stringify(["agents", pkg.root]);
+  const cached = getCachedValue<ReadAgentsResult>(key, fingerprint);
+  if (cached) return cached;
+  const result = readAgentsUncached(pkg);
+  setCachedValue(key, fingerprint, result);
+  return result;
+}
+
+function readAgentsUncached(pkg: PluginPackage): ReadAgentsResult {
   const out = new Map<string, AgentConfig>();
 
-  const manifest = asRecord(readJson(join(pkg.root, "plugin.json")));
+  const manifest = asRecord(readContainedJson(pkg.root, join(pkg.root, "plugin.json")));
   const extensions = asRecord(manifest?.extensions);
   const opencodeExt = asRecord(extensions?.[OPENCODE_NS]);
   const manifestAgents = asRecord(opencodeExt?.agents);
@@ -223,12 +258,12 @@ export function readAgents(
       continue;
     }
     if (out.has(name)) continue;
-    const agent = toAgentConfig(readJson(join(extDir, entry)), pkg.name, name);
+    const agent = toAgentConfig(readContainedJson(pkg.root, join(extDir, entry)), pkg.name, name);
     if (agent) out.set(name, agent);
   }
 
   const claudeManifest = asRecord(
-    readJson(join(pkg.root, ".claude-plugin", "plugin.json")),
+    readContainedJson(pkg.root, join(pkg.root, ".claude-plugin", "plugin.json")),
   );
   const claudeAgents = asRecord(claudeManifest?.agents);
   if (claudeAgents) {
@@ -248,13 +283,19 @@ export function readAgents(
       if (typeof src.systemPrompt === "string" && src.systemPrompt) {
         agent.prompt = src.systemPrompt;
       } else {
-        try {
-          agent.prompt = readFileSync(
-            join(pkg.root, "agents", name, "AGENTS.md"),
-            "utf8",
-          );
-        } catch {
-          // No prompt file; the description alone is enough to register.
+        // AGENTS.md is package-supplied prompt content: only read it when it
+        // resolves inside the package, so a symlinked shim cannot pull in an
+        // outside file's bytes.
+        const promptPath = resolveContained(
+          pkg.root,
+          join(pkg.root, "agents", name, "AGENTS.md"),
+        );
+        if (promptPath) {
+          try {
+            agent.prompt = readFileSync(promptPath, "utf8");
+          } catch {
+            // No prompt file; the description alone is enough to register.
+          }
         }
       }
       if (typeof src.model === "string") agent.model = src.model;
@@ -287,16 +328,24 @@ export function readAgents(
         continue;
       }
       if (out.has(name)) continue;
-      let content: string;
+      // Flat agent files are package-supplied prompt content: only read one
+      // when it resolves inside the package, so a symlinked .md cannot pull in
+      // an outside file's bytes.
+      const contained = resolveContained(pkg.root, join(flatAgentsDir, entry));
+      if (!contained) continue;
+      let parsed: { description?: string; color?: string; body: string } | null;
       try {
-        content = readFileSync(join(flatAgentsDir, entry), "utf8");
+        parsed = cachedRead("flat-agent-md", contained, (content) => {
+          // Bare .md files in the package root may be docs (README.md); only
+          // treat them as agents when they carry a frontmatter block.
+          if (isRoot && !/^---\s*\n/.test(content)) return null;
+          return parseAgentMarkdown(content);
+        });
       } catch {
         continue;
       }
-      // Bare .md files in the package root may be docs (README.md); only treat
-      // them as agents when they carry a frontmatter block.
-      if (isRoot && !/^---\s*\n/.test(content)) continue;
-      const { description, color, body } = parseAgentMarkdown(content);
+      if (!parsed) continue;
+      const { description, color, body } = parsed;
       if (!description && !body) continue;
       const agent: AgentConfig = {};
       if (description) agent.description = description;

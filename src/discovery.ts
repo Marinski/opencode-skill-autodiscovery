@@ -7,8 +7,12 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { cachedRead } from "./cache.js";
+import { getCachedPackages, setCachedPackages, fingerprintTree } from "./discovery-cache.js";
 import { log, sanitize } from "./log.js";
+import { PLUGIN_SCHEMA_1_0_0_ID, validatePluginManifest } from "./spec-schema.js";
 import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
 import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
@@ -31,9 +35,10 @@ export type PluginPackage = {
   source: PackageSource;
   /**
    * Two-tier trust model. True when the content was installed or fetched
-   * deliberately via a host tool or opencode itself (claude/vscode manifests,
-   * opencode's package cache). False when present merely as a side effect
-   * (project node_modules, manifest-less walks over user-supplied extra roots).
+   * deliberately via a host tool or opencode itself (claude/vscode manifests
+   * under home roots, opencode's package cache). False when present merely as
+   * a side effect (project node_modules, manifest-less walks, and any package
+   * reached through a user-supplied extra root).
    */
   trusted: boolean;
   name: string;
@@ -85,6 +90,17 @@ function isRegularFile(p: string): boolean {
   }
 }
 
+// True only for a JSON object container: not null, not an array, and not some
+// other object kind. Manifest inputs are parsed JSON, so this rejects every
+// shape other than a plain object before its keys are iterated.
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 // True when `child` resolves (through symlinks) inside `parent`.
 export function contains(parent: string, child: string): boolean {
   const p = realpathSync(parent);
@@ -94,16 +110,43 @@ export function contains(parent: string, child: string): boolean {
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+// Resolves `candidate` to its real path and returns it only when it still
+// lives inside `root` (through symlinks); returns null when it is missing or
+// escapes. This is the read gate for package files whose bytes feed config:
+// a package must not be able to ship a symlink (mcp.json, AGENTS.md, a flat
+// agent .md) that reads a file it never contained. A rejected candidate is
+// logged once, naming the package root and the outside target.
+export function resolveContained(root: string, candidate: string): string | null {
+  let resolved: string;
+  try {
+    resolved = realpathSync(candidate);
+  } catch {
+    return null;
+  }
+  if (!contains(root, resolved)) {
+    log(`skipping "${resolved}": resolves outside "${root}"`);
+    return null;
+  }
+  return resolved;
+}
+
 // Parses the YAML frontmatter of a SKILL.md (name, description). Returns null
 // when the file is unreadable or lacks a valid `name`.
 export function readSkillInfo(dir: string): SkillInfo | null {
   const skillMd = join(dir, "SKILL.md");
-  let content: string;
+  let parsed: { name: string; description: string } | null;
   try {
-    content = readFileSync(skillMd, "utf8");
+    parsed = cachedRead("skill-frontmatter", skillMd, parseSkillFrontmatter);
   } catch {
     return null;
   }
+  if (!parsed) return null;
+  return { dir, name: parsed.name, description: parsed.description };
+}
+
+function parseSkillFrontmatter(
+  content: string,
+): { name: string; description: string } | null {
   const frontmatter = /^---\s*\n([\s\S]*?)\n---/.exec(content)?.[1];
   if (!frontmatter) return null;
   const field = (key: string): string | undefined => {
@@ -115,7 +158,7 @@ export function readSkillInfo(dir: string): SkillInfo | null {
   if (!name) return null;
   // The description is written into config verbatim: strip ANSI escapes and
   // C0 control characters before it can reach any config surface.
-  return { dir, name, description: sanitize(field("description") ?? "") };
+  return { name, description: sanitize(field("description") ?? "") };
 }
 
 // Reads a conformant Agent Plugins 1.0.0 package from a directory root.
@@ -133,7 +176,7 @@ export function readPackage(
   if (!isRegularFile(manifestPath)) return null;
   let manifest: { $schema?: unknown; name?: unknown };
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest = cachedRead("plugin-manifest", manifestPath, (content) => JSON.parse(content));
   } catch {
     return null;
   }
@@ -141,7 +184,20 @@ export function readPackage(
   if (typeof manifest.$schema !== "string" || !PLUGIN_SCHEMA.test(manifest.$schema)) {
     return null;
   }
-  if (
+  // Rigorous structural validation against the real published schema, when
+  // this plugin has vendored a copy matching the declared version (today,
+  // only 1.0.0). Any other conformant 1.x.x version falls back to the
+  // name-only check below, so a future minor version is never rejected just
+  // because this plugin hasn't vendored its schema yet — see spec-schema.ts.
+  if (manifest.$schema === PLUGIN_SCHEMA_1_0_0_ID) {
+    const result = validatePluginManifest(manifest);
+    if (!result.valid) {
+      log(
+        `ignoring plugin.json at "${root}": fails Agent Plugins 1.0.0 schema (${result.errors.join("; ")})`,
+      );
+      return null;
+    }
+  } else if (
     typeof manifest.name !== "string" ||
     manifest.name.length === 0 ||
     manifest.name.length > 64 ||
@@ -149,6 +205,11 @@ export function readPackage(
   ) {
     return null;
   }
+  // Narrows `manifest.name` for TS: always true here (either branch above
+  // already guarantees it — ajv's `name` schema requires a string, the
+  // fallback branch checked it directly) but ajv validation doesn't carry
+  // type-level narrowing the way the explicit typeof check does.
+  if (typeof manifest.name !== "string") return null;
 
   const skillDirs: string[] = [];
   const skillsRoot = join(root, "skills");
@@ -162,7 +223,13 @@ export function readPackage(
     for (const entry of entries) {
       const dir = join(skillsRoot, entry);
       if (!isDirectory(dir)) continue;
-      if (!isRegularFile(join(dir, "SKILL.md"))) continue;
+      const skillMd = join(dir, "SKILL.md");
+      if (!isRegularFile(skillMd)) continue;
+      // The directory alone is not enough: a package can keep the skill dir
+      // in-root while symlinking its SKILL.md to an outside file, whose bytes
+      // would otherwise become prompt material. Require the skill file itself
+      // to resolve inside the package too.
+      if (!resolveContained(root, skillMd)) continue;
       let resolved: string;
       try {
         resolved = realpathSync(dir);
@@ -174,9 +241,12 @@ export function readPackage(
     }
   }
 
-  const mcpPath = isRegularFile(join(root, "mcp.json"))
-    ? join(root, "mcp.json")
-    : undefined;
+  // mcp.json is package-supplied input read into config.mcp: resolve it
+  // through the containment gate first, so a symlink cannot point it at a
+  // file outside the package.
+  const mcpResolved = resolveContained(root, join(root, "mcp.json"));
+  const mcpPath =
+    mcpResolved && isRegularFile(mcpResolved) ? mcpResolved : undefined;
 
   return {
     source,
@@ -249,7 +319,11 @@ function findSkillDirsUnder(
       log(`skipping skill dir "${child}": resolves outside "${realRoot}"`);
       continue;
     }
-    if (isRegularFile(join(child, "SKILL.md"))) {
+    const childSkillMd = join(child, "SKILL.md");
+    if (isRegularFile(childSkillMd)) {
+      // A skill dir whose SKILL.md symlinks outside the walk root must not be
+      // emitted: readSkillInfo (and opencode) would read the outside bytes.
+      if (!resolveContained(realRoot, childSkillMd)) continue;
       out.add(child);
     } else {
       findSkillDirsUnder(realRoot, child, out, seen, depth + 1);
@@ -264,7 +338,12 @@ function hasPluginLayout(root: string): boolean {
   const skillsRoot = join(root, "skills");
   if (isDirectory(skillsRoot)) {
     try {
-      if (readdirSync(skillsRoot).some((e) => isRegularFile(join(skillsRoot, e, "SKILL.md")))) {
+      if (
+        readdirSync(skillsRoot).some((e) => {
+          const skillMd = join(skillsRoot, e, "SKILL.md");
+          return resolveContained(root, skillMd) !== null && isRegularFile(skillMd);
+        })
+      ) {
         return true;
       }
     } catch {
@@ -288,12 +367,20 @@ function hasRootAgentFiles(root: string): boolean {
   }
   return entries.some((e) => {
     if (!e.endsWith(".md")) return false;
-    const full = join(root, e);
-    if (!isRegularFile(full)) return false;
-    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(full, "utf8"))?.[1];
-    if (!m) return false;
-    return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
+    const contained = resolveContained(root, join(root, e));
+    if (!contained || !isRegularFile(contained)) return false;
+    try {
+      return cachedRead("agent-frontmatter-check", contained, hasAgentFrontmatter);
+    } catch {
+      return false;
+    }
   });
+}
+
+function hasAgentFrontmatter(content: string): boolean {
+  const m = /^---\s*\n([\s\S]*?)\n---/.exec(content)?.[1];
+  if (!m) return false;
+  return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
 }
 
 // Returns directories under `root` that are individual plugin roots. This
@@ -301,31 +388,105 @@ function hasRootAgentFiles(root: string): boolean {
 // clone, and inside a marketplace like agency-agents each
 // ref_plugins/plugins/<division> dir), so a clone on disk is registered
 // per-plugin instead of as one opaque tree that hides its agents.
+//
+// Hardened like findSkillDirs: traversal and emitted roots are keyed on real
+// (symlink-resolved) paths, so symlink cycles — self-referential or
+// ancestor-pointing — terminate instead of growing ever-longer lexical paths
+// until stack exhaustion, and nothing that resolves outside the starting root
+// is emitted. `isDirectory` uses statSync, which follows symlinks, so the
+// realpath dedupe below is what bounds the walk.
 export function findPluginRoots(root: string, out: string[]): void {
-  if (hasPluginLayout(root)) {
-    out.push(root);
+  let resolved: string;
+  try {
+    resolved = realpathSync(root);
+  } catch {
+    return;
+  }
+  findPluginRootsUnder(resolved, resolved, out, new Set());
+}
+
+// Equivalent to a caller doing `findPluginRoots(root, roots)` and converting
+// each hit with `packageFromDir(pluginRoot, source, trusted)` — the exact
+// pattern collectAgentPluginRoot's fallback and collectClaude's remote walk
+// both used before discovery-cache.ts existed — except a cheap fingerprint
+// check of `root` (see fingerprintTree) can skip the real walk, and every
+// file read inside it, entirely when the subtree hasn't changed since the
+// last run. A miss falls back to exactly the walk+convert callers did
+// before, so this is never slower than the un-cached baseline.
+//
+// `exclude` is deliberately the caller's job, applied identically on a hit
+// or a miss, so changing the exclude list never has to invalidate the cache.
+function findPluginPackagesCached(
+  root: string,
+  source: PackageSource,
+  trusted: boolean,
+): PluginPackage[] {
+  const fingerprint = fingerprintTree(root);
+  const key = JSON.stringify([source, root]);
+  const cached = getCachedPackages(key, fingerprint);
+  if (cached) return cached;
+  const roots: string[] = [];
+  findPluginRoots(root, roots);
+  const packages: PluginPackage[] = [];
+  for (const pluginRoot of roots) {
+    const pkg = packageFromDir(pluginRoot, source, trusted);
+    if (pkg) packages.push(pkg);
+  }
+  setCachedPackages(key, fingerprint, packages);
+  return packages;
+}
+
+function findPluginRootsUnder(
+  realRoot: string,
+  dir: string,
+  out: string[],
+  seen: Set<string>,
+  depth = 0,
+) {
+  if (depth > MAX_WALK_DEPTH) return;
+  if (seen.has(dir)) return;
+  seen.add(dir);
+  if (hasPluginLayout(dir)) {
+    out.push(dir);
     return;
   }
   let entries: string[];
   try {
-    entries = readdirSync(root);
+    entries = readdirSync(dir);
   } catch {
     return;
   }
   for (const entry of entries) {
     if (entry === ".git" || entry === "node_modules") continue;
-    const full = join(root, entry);
+    const full = join(dir, entry);
     if (!isDirectory(full)) continue;
-    findPluginRoots(full, out);
+    let child: string;
+    try {
+      child = realpathSync(full);
+    } catch {
+      continue;
+    }
+    if (!contains(realRoot, child)) {
+      log(`skipping plugin dir "${child}": resolves outside "${realRoot}"`);
+      continue;
+    }
+    findPluginRootsUnder(realRoot, child, out, seen, depth + 1);
   }
 }
 
 // True when a legacy Claude Code plugin declares at least one agent, so an
 // agents-only plugin is still discovered even though it ships no skills.
 function hasClaudeAgents(root: string): boolean {
+  const manifestPath = resolveContained(
+    root,
+    join(root, ".claude-plugin", "plugin.json"),
+  );
+  if (!manifestPath) return false;
   try {
-    const manifest: unknown = JSON.parse(
-      readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"),
+    const manifest: unknown = cachedRead(
+      "claude-legacy-manifest",
+      manifestPath,
+      (content) => JSON.parse(content),
     );
     if (typeof manifest !== "object" || manifest === null) return false;
     const agents = (manifest as Record<string, unknown>).agents;
@@ -344,8 +505,11 @@ function hasClaudeAgents(root: string): boolean {
 // even without a manifest `agents` field.
 function hasFlatAgents(root: string): boolean {
   if (hasRootAgentFiles(root)) return true;
+  const agentsDir = join(root, "agents");
   try {
-    return readdirSync(join(root, "agents")).some((e) => e.endsWith(".md"));
+    return readdirSync(agentsDir).some(
+      (e) => e.endsWith(".md") && resolveContained(root, join(agentsDir, e)) !== null,
+    );
   } catch {
     return false;
   }
@@ -397,9 +561,14 @@ export function packageFromDir(
 // `agentPlugins` on newer builds; remote servers nest theirs under `data/`
 // (~/.vscode-server/data/agentPlugins). We list every known candidate so the
 // discovery works regardless of OS, build channel, or local/remote setup.
-function vsCodeDataRoots(extra: string[]): string[] {
+//
+// A data root carries its provenance: built-in per-platform home roots are
+// trusted (VS Code itself owns them), while user-supplied `extraRoots` are not.
+type DataRoot = { root: string; trusted: boolean };
+
+function vsCodeDataRoots(extra: string[]): DataRoot[] {
   const home = homedir();
-  const roots = new Set<string>([
+  const builtIn = new Set<string>([
     join(home, ".vscode"),
     // Linux
     join(home, ".config", "Code"),
@@ -419,53 +588,106 @@ function vsCodeDataRoots(extra: string[]): string[] {
     join(home, ".vscode-server-insiders"),
     join(home, ".vscode-remote"),
   ]);
-  for (const root of extra) roots.add(root);
-  return [...roots];
-}
-
-function agentPluginDirs(roots: string[]): string[] {
-  const dirs = new Set<string>();
-  for (const root of roots) {
-    dirs.add(join(root, "agent-plugins"));
-    dirs.add(join(root, "agentPlugins"));
-    dirs.add(join(root, "data", "agent-plugins"));
-    dirs.add(join(root, "data", "agentPlugins"));
+  const roots: DataRoot[] = [...builtIn].map((root) => ({ root, trusted: true }));
+  const seen = new Set(builtIn);
+  for (const root of extra) {
+    if (seen.has(root)) continue;
+    seen.add(root);
+    roots.push({ root, trusted: false });
   }
-  return [...dirs];
+  return roots;
 }
 
+function agentPluginDirs(roots: DataRoot[]): DataRoot[] {
+  const seen = new Set<string>();
+  const dirs: DataRoot[] = [];
+  for (const { root, trusted } of roots) {
+    for (const dir of [
+      join(root, "agent-plugins"),
+      join(root, "agentPlugins"),
+      join(root, "data", "agent-plugins"),
+      join(root, "data", "agentPlugins"),
+    ]) {
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      dirs.push({ root: dir, trusted });
+    }
+  }
+  return dirs;
+}
+
+// Resolves an `installed.json` `pluginUri` to an on-disk plugin root. Only
+// `file:` URLs name a local directory: non-file schemes and malformed URLs are
+// dropped (with a log) rather than echoed into the filesystem, and the
+// resolved target must be an existing directory. `fileURLToPath` owns the
+// slash/percent/drive-letter normalization; `resolve` then canonicalizes the
+// result so a technically valid URL like `file:////abs` yields the same root
+// string as its `file:///abs` spelling.
 function vscodePluginPath(pluginUri: string): string | null {
-  const m = /^file:\/\/(.+)$/.exec(pluginUri);
-  if (!m) return pluginUri;
-  let raw: string;
+  let resolved: string;
   try {
-    raw = decodeURIComponent(m[1]);
+    resolved = resolve(fileURLToPath(pluginUri));
   } catch {
-    raw = m[1];
+    log(`ignoring plugin URI "${pluginUri}": not a resolvable file: URL`);
+    return null;
   }
-  if (raw.startsWith("/")) raw = raw.slice(1);
-  return raw;
+  // `file://` (and `file:///`) resolve to the filesystem root; a plugin root
+  // is never the root itself, and walking it would scan the whole disk.
+  if (dirname(resolved) === resolved) {
+    log(`ignoring plugin URI "${pluginUri}": filesystem root is not a plugin root`);
+    return null;
+  }
+  if (!isDirectory(resolved)) {
+    log(`ignoring plugin URI "${pluginUri}": "${resolved}" is not a directory`);
+    return null;
+  }
+  return resolved;
 }
 
 export function collectVscodeManifest(
   out: PluginPackage[],
   installedJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
-  let manifest: { installed?: Array<{ pluginUri?: string }> };
+  let manifest: unknown;
   try {
     manifest = JSON.parse(readFileSync(installedJson, "utf8"));
   } catch {
     return;
   }
-  for (const plugin of manifest.installed ?? []) {
-    if (!plugin.pluginUri) continue;
-    const dir = vscodePluginPath(plugin.pluginUri);
-    if (dir) {
-      const pkg = packageFromDir(dir, "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+  // installed.json is manifest input: fail closed on a malformed shape rather
+  // than iterating a non-array (which throws) or trusting entry types.
+  const installed = isPlainObject(manifest) ? manifest.installed : undefined;
+  if (!Array.isArray(installed)) {
+    log(`ignoring "${installedJson}": "installed" is not an array`);
+    return;
+  }
+  const root = dirname(installedJson);
+  for (const plugin of installed) {
+    if (!isPlainObject(plugin)) {
+      log(`ignoring entry in "${installedJson}": entry is not an object`);
+      continue;
     }
+    const pluginUri = plugin.pluginUri;
+    if (typeof pluginUri !== "string") {
+      log(`ignoring entry in "${installedJson}": "pluginUri" is not a string`);
+      continue;
+    }
+    const dir = vscodePluginPath(pluginUri);
+    if (!dir) continue;
+    // installed.json is manifest input: under an untrusted root the recorded
+    // install location must resolve inside that root. A trusted home root is
+    // allowed to point at a global extension directory outside the data root.
+    if (!trusted && !contains(root, dir)) {
+      log(
+        `skipping plugin URI "${pluginUri}": "${dir}" is outside untrusted root "${root}"`,
+      );
+      continue;
+    }
+    const pkg = packageFromDir(dir, "vscode", trusted);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
@@ -480,6 +702,7 @@ export function collectVscodeCache(
   out: PluginPackage[],
   cacheJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(cacheJson)) return;
   let entries: CacheEntry[];
@@ -497,17 +720,22 @@ export function collectVscodeCache(
       typeof entry.nonce === "string" && entry.nonce
         ? sanitizeKey(entry.nonce)
         : "default";
+    // Layouts without the {nonce} subdirectory materialize the bundle
+    // directly under {key}; falling back only when the nonce dir is absent
+    // avoids re-descending into it.
     const nonceDir = join(parent, key, nonce);
-    if (isDirectory(nonceDir)) {
-      const pkg = packageFromDir(nonceDir, "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
-    } else {
-      // Layouts without the {nonce} subdirectory materialize the bundle
-      // directly under {key}; walking it only when the nonce dir is absent
-      // avoids re-descending into it.
-      const pkg = packageFromDir(join(parent, key), "vscode", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    const dir = isDirectory(nonceDir) ? nonceDir : join(parent, key);
+    if (!isDirectory(dir)) continue;
+    // cache.json is manifest input: under an untrusted root the bundle must
+    // resolve inside that root, not be redirected elsewhere on disk.
+    if (!trusted && !contains(parent, dir)) {
+      log(
+        `skipping cache entry "${entry.uri}": "${dir}" is outside untrusted root "${parent}"`,
+      );
+      continue;
     }
+    const pkg = packageFromDir(dir, "vscode", trusted);
+    if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
   }
 }
 
@@ -525,11 +753,12 @@ function collectAgentPluginRoot(
   out: PluginPackage[],
   root: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   const installedJson = join(root, "installed.json");
   const cacheJson = join(root, "cache.json");
-  collectVscodeManifest(out, installedJson, exclude);
-  collectVscodeCache(out, cacheJson, exclude);
+  collectVscodeManifest(out, installedJson, exclude, trusted);
+  collectVscodeCache(out, cacheJson, exclude, trusted);
   // `installed.json` is the authoritative record of what VS Code installed;
   // when it exists, respect it exactly and skip the fallback walk so
   // cloned-but-not-installed marketplaces stay hidden.
@@ -540,11 +769,8 @@ function collectAgentPluginRoot(
   // clone) has no manifest entry at all. Only suppress the walk when
   // installed.json exists, so any clone actually on disk is still discovered.
   if (!existsSync(installedJson)) {
-    const pluginRoots: string[] = [];
-    findPluginRoots(root, pluginRoots);
-    for (const pluginRoot of pluginRoots) {
-      const pkg = packageFromDir(pluginRoot, "vscode", false);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    for (const pkg of findPluginPackagesCached(root, "vscode", false)) {
+      if (!isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }
@@ -554,31 +780,55 @@ export function collectVscode(
   extra: string[],
   exclude: string[] = [],
 ): void {
-  for (const dir of agentPluginDirs(vsCodeDataRoots(extra))) {
-    collectAgentPluginRoot(out, dir, exclude);
+  for (const { root, trusted } of agentPluginDirs(vsCodeDataRoots(extra))) {
+    collectAgentPluginRoot(out, root, exclude, trusted);
   }
 }
 
 // --- Claude Code plugin discovery ------------------------------------------
 
+// `trusted` defaults to true: every Claude root is home-scoped and
+// host-managed (`~/.claude/...`), so it stays trusted. The parameter exists
+// for symmetry with the VS Code collectors, letting a caller mark a non-home
+// manifest untrusted.
 export function collectClaudeManifest(
   out: PluginPackage[],
   installedJson: string,
   exclude: string[] = [],
+  trusted = true,
 ): void {
   if (!existsSync(installedJson)) return;
-  let manifest: { plugins?: Record<string, Array<{ installPath?: string }>> };
+  let manifest: unknown;
   try {
     manifest = JSON.parse(readFileSync(installedJson, "utf8"));
   } catch {
     return;
   }
-  for (const versions of Object.values(manifest.plugins ?? {})) {
+  // installed_plugins.json is manifest input: fail closed when `plugins` is not
+  // a plain object, when a version bucket is not an array, or when an entry
+  // lacks a string installPath.
+  const plugins = isPlainObject(manifest) ? manifest.plugins : undefined;
+  if (!isPlainObject(plugins)) {
+    log(`ignoring "${installedJson}": "plugins" is not an object`);
+    return;
+  }
+  for (const versions of Object.values(plugins)) {
+    if (!Array.isArray(versions)) {
+      log(`ignoring entry in "${installedJson}": plugin versions are not an array`);
+      continue;
+    }
     for (const plugin of versions) {
-      if (plugin.installPath) {
-        const pkg = packageFromDir(plugin.installPath, "claude", true);
-        if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+      if (!isPlainObject(plugin)) {
+        log(`ignoring entry in "${installedJson}": entry is not an object`);
+        continue;
       }
+      const installPath = plugin.installPath;
+      if (typeof installPath !== "string") {
+        log(`ignoring entry in "${installedJson}": "installPath" is not a string`);
+        continue;
+      }
+      const pkg = packageFromDir(installPath, "claude", trusted);
+      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }
@@ -602,11 +852,8 @@ export function collectClaude(
   // the same-source mirror dedup in planConfig collapses any overlap.
   const remoteRoot = join(home, ".claude", "remote", "plugins");
   if (existsSync(remoteRoot)) {
-    const roots: string[] = [];
-    findPluginRoots(remoteRoot, roots);
-    for (const pluginRoot of roots) {
-      const pkg = packageFromDir(pluginRoot, "claude", true);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    for (const pkg of findPluginPackagesCached(remoteRoot, "claude", true)) {
+      if (!isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }

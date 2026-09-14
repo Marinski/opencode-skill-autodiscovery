@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import {
   applyConfigPatch,
   collectClaude,
@@ -21,6 +21,7 @@ import {
   collectVscodeCache,
   collectVscodeManifest,
   contains,
+  findPluginRoots,
   findSkillDirs,
   packageFromDir,
   planConfig,
@@ -28,6 +29,7 @@ import {
   readMcp,
   readPackage,
 } from "../dist/discovery.js";
+import { fingerprintTree, getCachedPackages } from "../dist/discovery-cache.js";
 import { sanitize } from "../dist/log.js";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -41,6 +43,21 @@ function makeTemp(prefix = "oc-test-") {
 
 function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
+}
+
+// Points homedir() at `dir` for the duration of a test and returns a restore
+// function. Used to exercise the built-in (trusted) home roots hermetically.
+function useHome(dir) {
+  const oldHome = process.env.HOME;
+  const oldUser = process.env.USERPROFILE;
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  return () => {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    if (oldUser === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = oldUser;
+  };
 }
 
 function makePackage(root, name, skills = [], mcp = null) {
@@ -187,7 +204,30 @@ test("readPackage: rejects missing manifest, bad JSON, bad $schema, missing name
   }
 });
 
-test("readPackage: unknown top-level fields are ignored", () => {
+test("readPackage: a stray top-level field (not the extensions namespace) fails the real schema, not silently ignored", () => {
+  // Agent Plugins 1.0.0's published plugin.schema.json has
+  // additionalProperties: false at the document root — a manifest carrying
+  // an unrecognized top-level key is not conformant, full stop; the spec's
+  // sanctioned place for client-specific data is `extensions.<namespace>`
+  // (covered by the next test). readPackage rejects it (returns null) rather
+  // than silently treating a non-conformant manifest as valid; the caller's
+  // existing legacy-discovery fallback still applies, so this never breaks a
+  // real package, it just stops mis-trusting an invalid manifest.
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg", mystery: { anything: true } }),
+    );
+    assert.equal(readPackage(pkgDir, "node_modules"), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readPackage: client-specific data belongs under extensions.<namespace>, which the real schema allows", () => {
   const root = makeTemp();
   try {
     const pkgDir = join(root, "pkg");
@@ -197,7 +237,6 @@ test("readPackage: unknown top-level fields are ignored", () => {
       JSON.stringify({
         $schema: SCHEMA,
         name: "pkg",
-        mystery: { anything: true },
         extensions: { "com.example.client": { setting: 1 } },
       }),
     );
@@ -264,6 +303,153 @@ test("readPackage: symlinked skill dir outside the root is skipped", (t) => {
     const pkg = readPackage(pkgDir, "node_modules");
     assert.ok(pkg);
     assert.deepEqual(pkg.skillDirs, []);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readPackage: symlinked mcp.json outside the package root is not exposed", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    const outsideMcp = join(outside, "mcp.json");
+    writeFileSync(
+      outsideMcp,
+      JSON.stringify({
+        $schema: MCP_SCHEMA_URL,
+        mcpServers: { evil: { type: "stdio", command: "evil" } },
+      }),
+    );
+    try {
+      symlinkSync(outsideMcp, join(pkgDir, "mcp.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let pkg;
+    try {
+      pkg = readPackage(pkgDir, "node_modules");
+    } finally {
+      console.error = origError;
+    }
+
+    assert.ok(pkg);
+    assert.equal(pkg.mcpPath, undefined);
+    const entries = [];
+    readMcp(pkg, entries);
+    assert.deepEqual(entries, []);
+    // One loud line naming the package root and the outside target.
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /resolves outside/);
+    assert.ok(logs[0].includes(pkgDir));
+    assert.ok(logs[0].includes(realpathSync(outsideMcp)));
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readPackage: in-root symlinked mcp.json alias still resolves", (t) => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, "shared"), { recursive: true });
+    const realMcp = join(pkgDir, "shared", "mcp.json");
+    writeFileSync(
+      realMcp,
+      JSON.stringify({
+        $schema: MCP_SCHEMA_URL,
+        mcpServers: { ok: { type: "stdio", command: "ok" } },
+      }),
+    );
+    try {
+      symlinkSync(realMcp, join(pkgDir, "mcp.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    assert.ok(pkg);
+    assert.equal(pkg.mcpPath, realpathSync(join(pkgDir, "mcp.json")));
+    const entries = [];
+    readMcp(pkg, entries);
+    assert.deepEqual(entries.map((e) => e.key), ["ok"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readPackage: a SKILL.md symlinked outside the package root is not emitted", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, "skills", "evil"), { recursive: true });
+    const outsideMd = join(outside, "SKILL.md");
+    writeFileSync(outsideMd, "---\nname: pwned\ndescription: SECRET SKILL BYTES\n---\n");
+    try {
+      symlinkSync(outsideMd, join(pkgDir, "skills", "evil", "SKILL.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let pkg;
+    let plan;
+    try {
+      pkg = readPackage(pkgDir, "node_modules");
+      plan = planConfig([pkg], {}, {});
+    } finally {
+      console.error = origError;
+    }
+
+    assert.ok(pkg);
+    assert.deepEqual(pkg.skillDirs, [], "no skill dir emitted for an escaping SKILL.md");
+    assert.deepEqual(plan.commands, [], "no command carries the outside bytes");
+    assert.ok(
+      logs.some((line) => line.includes(realpathSync(outsideMd))),
+      "log names the outside target",
+    );
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readPackage: in-root symlinked SKILL.md alias still resolves", (t) => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, "shared"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "shared", "SKILL.md"),
+      "---\nname: aliased\ndescription: aliased description\n---\n",
+    );
+    mkdirSync(join(pkgDir, "skills", "alias"), { recursive: true });
+    try {
+      symlinkSync(
+        join(pkgDir, "shared", "SKILL.md"),
+        join(pkgDir, "skills", "alias", "SKILL.md"),
+        "file",
+      );
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    assert.equal(pkg.skillDirs.length, 1);
+    const plan = planConfig([pkg], {}, {});
+    assert.deepEqual(plan.commands.map((c) => c.name), ["aliased"]);
   } finally {
     cleanup(root);
   }
@@ -502,6 +688,125 @@ test("findSkillDirs: depth cap stops the descent past 16 levels", () => {
   }
 });
 
+test("findSkillDirs: a SKILL.md symlinked outside the walk root is not emitted", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    mkdirSync(join(root, "s"), { recursive: true });
+    const outsideMd = join(outside, "SKILL.md");
+    writeFileSync(outsideMd, "---\nname: pwned\ndescription: SECRET SKILL BYTES\n---\n");
+    try {
+      symlinkSync(outsideMd, join(root, "s", "SKILL.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    const out = new Set();
+    findSkillDirs(root, out, new Set());
+    assert.deepEqual(goldenPaths(root, out), []);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+// findPluginRoots backs the VS Code/claude fallback walks over on-disk plugin
+// trees. Like findSkillDirs it must terminate on symlink cycles and never emit
+// a root that resolves outside the walked tree.
+
+test("findPluginRoots: terminates on a self-referential symlink cycle", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  try {
+    // VS Code-style data root: github.com/{org}/{repo} plugin clones.
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    symlinkSync(
+      root,
+      join(root, "self"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // Completing at all is the bound: the old lexical walk recursed on
+    // root/self/self/self/... until stack exhaustion. Only the real, in-root
+    // plugin clone is emitted.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findPluginRoots: terminates when a descendant links back to an ancestor", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  try {
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    symlinkSync(
+      root,
+      join(root, "github.com", "back"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // `github.com/back` resolves to the already-visited ancestor and must not
+    // be re-walked; only the real, in-root plugin clone is emitted.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("findPluginRoots: never emits a plugin root symlinked outside the walk root", (t) => {
+  if (!supportsSymlinks()) {
+    t.skip("cannot create symlink/junction on this platform");
+    return;
+  }
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    makePackage(join(root, "github.com", "org", "repo"), "repo", ["s"]);
+    makePackage(join(outside, "evil"), "evil", ["s"]);
+    symlinkSync(
+      join(outside, "evil"),
+      join(root, "github.com", "escape"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const out = [];
+    findPluginRoots(root, out);
+    // The escaping link resolves outside `root`: neither it nor its plugin
+    // root may be emitted, even though the link itself sits inside the tree.
+    assert.deepEqual(goldenPaths(root, out), ["github.com/org/repo"]);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("findPluginRoots: depth cap stops the descent past 16 levels", () => {
+  const root = makeTemp();
+  try {
+    // A plain nested chain (no symlinks): a plugin root inside the cap is
+    // found, one far below it is not, and the walk always terminates.
+    const segments = Array.from({ length: 20 }, (_, i) => `l${i}`);
+    writeSkillDir(join(root, ...segments, "too-deep"), "too-deep");
+    writeSkillDir(join(root, ...segments.slice(0, 14), "in-cap"), "in-cap");
+
+    const out = [];
+    findPluginRoots(root, out);
+    assert.deepEqual(goldenPaths(root, out), [
+      [...segments.slice(0, 14), "in-cap"].join("/"),
+    ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectNodeModules: finds unscoped and scoped packages only", () => {
   const root = makeTemp();
   try {
@@ -614,6 +919,56 @@ test("readMcp: missing or mismatched $schema disables MCP for the package", () =
     const out = [];
     readMcp(pkg, out);
     assert.equal(out.length, 0);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: a 1.0.0 stdio entry declaring the reserved PLUGIN_ROOT/PLUGIN_DATA env keys is rejected outright by the real schema", () => {
+  // The published mcp.schema.json's env sub-schema forbids these two names
+  // via propertyNames — a stricter behavior than the old hand-rolled path
+  // (see the fallback-version test below), which just dropped the reserved
+  // key and kept the rest of the entry. For a package declaring exactly
+  // 1.0.0 this plugin now defers to the real schema: the whole entry is
+  // invalid, not just that one key, so it is skipped and logged rather than
+  // silently modified and kept.
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: { srv: { type: "stdio", command: "npx", env: { PLUGIN_ROOT: "haha" } } },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+    const out = [];
+    readMcp(pkg, out);
+    assert.equal(out.length, 0, "the whole entry is rejected, not silently modified");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: for a conformant version this plugin hasn't vendored a schema for, the reserved env key is still just dropped (fallback behavior preserved)", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    const version = "https://agent-plugins.org/schemas/1.1.0";
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: `${version}/plugin.schema.json`, name: "pkg" }),
+    );
+    writeFileSync(
+      join(pkgDir, "mcp.json"),
+      JSON.stringify({
+        $schema: `${version}/mcp.schema.json`,
+        mcpServers: { srv: { type: "stdio", command: "npx", env: { PLUGIN_ROOT: "haha" } } },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const out = [];
+    readMcp(pkg, out);
+    assert.equal(out.length, 1, "the entry survives via the fallback (non-ajv) path");
+    assert.equal(out[0].entry.environment.PLUGIN_ROOT, pkgDir, "the real PLUGIN_ROOT wins, not the package's spoofed value");
   } finally {
     cleanup(root);
   }
@@ -1306,6 +1661,35 @@ test("collectClaudeManifest: resolves installPaths from installed_plugins.json",
   }
 });
 
+test("collectClaudeManifest: malformed manifests fail closed without throwing or emitting", () => {
+  const root = makeTemp();
+  try {
+    const cases = [
+      { label: "plugins: null", body: { plugins: null } },
+      { label: "plugins: { a: {} }", body: { plugins: { a: {} } } },
+      { label: "plugins: { a: [null] }", body: { plugins: { a: [null] } } },
+      { label: "plugins: { a: [{}] }", body: { plugins: { a: [{}] } } },
+    ];
+    const manifestPath = join(root, "installed_plugins.json");
+    for (const { label, body } of cases) {
+      writeFileSync(manifestPath, JSON.stringify(body));
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      const out = [];
+      try {
+        collectClaudeManifest(out, manifestPath);
+      } finally {
+        console.error = origError;
+      }
+      assert.deepEqual(out, [], `${label}: no package emitted`);
+      assert.equal(logs.length, 1, `${label}: exactly one log line`);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("collectClaude: walks hash-named remote plugin dirs for flat agents and skills", () => {
   const root = makeTemp();
   try {
@@ -1332,6 +1716,19 @@ test("collectClaude: walks hash-named remote plugin dirs for flat agents and ski
       const agents = readAgents(pkg);
       assert.equal(agents.length, 1);
       assert.equal(agents[0].name, "engineering-code-reviewer");
+
+      // Regression guard for the original reported bug: this remote walk
+      // (the exact code path that scans ~/.claude/remote/plugins) must go
+      // through findPluginPackagesCached, not a bare findPluginRoots call,
+      // or a large synced marketplace re-walks and re-reads every file on
+      // every single opencode launch. Verify the whole-root cache actually
+      // recorded this scan under the "claude" source, keyed on the remote
+      // root — not just that discovery itself is correct.
+      const fingerprint = fingerprintTree(remote);
+      const cached = getCachedPackages(JSON.stringify(["claude", remote]), fingerprint);
+      assert.ok(cached, "collectClaude's remote walk populates the whole-root cache");
+      assert.equal(cached.length, 1);
+      assert.equal(cached[0].name, pkg.name);
     } finally {
       if (oldHome === undefined) delete process.env.HOME;
       else process.env.HOME = oldHome;
@@ -1364,6 +1761,205 @@ test("collectVscodeManifest: resolves pluginUri entries from installed.json", ()
   }
 });
 
+test("collectVscodeManifest: a pluginUri traversing outside the declaring root is rejected", () => {
+  const root = makeTemp();
+  const escapee = makeTemp("oc-escaped-");
+  cleanup(escapee); // the traversal target must not exist
+  try {
+    makePackage(join(root, "pkg"), "inside", ["s"]);
+    const base = root.replace(/\\/g, "/");
+    // The URL parser collapses the literal `..` segments, so this URI names
+    // <tmpdir>/<escapee> — outside the declaring root and not an existing
+    // directory, so it is rejected. (Containment of *existing* outside roots
+    // under an untrusted root is covered below.)
+    const uri = `file:///${base}/pkg/../../${basename(escapee)}`;
+    const manifestPath = join(root, "installed.json");
+    writeFileSync(manifestPath, JSON.stringify({ installed: [{ pluginUri: uri }] }));
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscodeManifest(out, manifestPath);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(out.length, 0, "escaped plugin root is not admitted");
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /is not a directory/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: non-file schemes and non-directory targets are rejected", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(join(root, "pkg"), "beta", ["t"]);
+    const fileTarget = join(root, "not-a-dir.txt");
+    writeFileSync(fileTarget, "not a directory");
+    const manifestPath = join(root, "installed.json");
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        installed: [
+          { pluginUri: "vscode://synced/bundle" },
+          { pluginUri: "file:///" },
+          { pluginUri: `file:///${fileTarget.replace(/\\/g, "/")}` },
+          { pluginUri: `file:///${pkgDir.replace(/\\/g, "/")}` },
+        ],
+      }),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscodeManifest(out, manifestPath);
+    } finally {
+      console.error = origError;
+    }
+
+    // Only the `file:` URI naming an existing, non-root directory survives;
+    // the backslash-normalized fixture resolves to the canonical absolute root.
+    assert.deepEqual(out.map((p) => p.name), ["beta"]);
+    assert.equal(out[0].root, resolve(pkgDir));
+    assert.equal(logs.length, 3);
+    assert.match(logs[0], /not a resolvable file: URL/);
+    assert.match(logs[1], /filesystem root is not a plugin root/);
+    assert.match(logs[2], /is not a directory/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeManifest: malformed installed fail closed without throwing or emitting", () => {
+  const root = makeTemp();
+  try {
+    const cases = [
+      { label: "installed: null", body: { installed: null } },
+      { label: "installed: {}", body: { installed: {} } },
+      { label: "installed: [null]", body: { installed: [null] } },
+      { label: "installed: [{}]", body: { installed: [{}] } },
+    ];
+    const manifestPath = join(root, "installed.json");
+    for (const { label, body } of cases) {
+      writeFileSync(manifestPath, JSON.stringify(body));
+      const logs = [];
+      const origError = console.error;
+      console.error = (...args) => logs.push(args.map(String).join(" "));
+      const out = [];
+      try {
+        collectVscodeManifest(out, manifestPath);
+      } finally {
+        console.error = origError;
+      }
+      assert.deepEqual(out, [], `${label}: no package emitted`);
+      assert.equal(logs.length, 1, `${label}: exactly one log line`);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscode: an untrusted extra root cannot register a package outside itself", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  const restoreHome = useHome(emptyHome);
+  try {
+    const escapedPkg = makePackage(join(outside, "pkg"), "planted", ["s"]);
+    const agentPlugins = join(root, "agentPlugins");
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${escapedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscode(out, [root]);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(
+      out.some((p) => p.name === "planted"),
+      false,
+      "escaped reference under an untrusted root is skipped",
+    );
+    assert.ok(
+      logs.some((line) => line.includes(agentPlugins)),
+      "log names the untrusted root",
+    );
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("collectVscode: a contained package under an untrusted extra root is untrusted", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const restoreHome = useHome(emptyHome);
+  try {
+    const agentPlugins = join(root, "agentPlugins");
+    const containedPkg = makePackage(join(agentPlugins, "pkg"), "contained", ["s"]);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${containedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, [root]);
+    const pkg = out.find((p) => p.name === "contained");
+    assert.ok(pkg, "contained package discovered");
+    assert.equal(pkg.trusted, false, "extra-root manifest package is untrusted");
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+  }
+});
+
+test("collectVscode: a contained package under a built-in home root stays trusted", () => {
+  const home = makeTemp("oc-home-");
+  const restoreHome = useHome(home);
+  try {
+    const agentPlugins = join(home, ".vscode", "agent-plugins");
+    const containedPkg = makePackage(join(agentPlugins, "pkg"), "contained", ["s"]);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${containedPkg.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, []);
+    const pkg = out.find((p) => p.name === "contained");
+    assert.ok(pkg, "home-root package discovered");
+    assert.equal(pkg.trusted, true, "home-root manifest package stays trusted");
+  } finally {
+    restoreHome();
+    cleanup(home);
+  }
+});
+
 test("collectVscodeCache: resolves synced bundles with and without a nonce subdir", () => {
   const root = makeTemp();
   try {
@@ -1386,6 +1982,101 @@ test("collectVscodeCache: resolves synced bundles with and without a nonce subdi
     // The with-nonce bundle must not be discovered twice via the {key} walk.
     assert.equal(out.filter((p) => p.name === "synced").length, 1);
   } finally {
+    cleanup(root);
+  }
+});
+
+test("collectVscodeCache: an untrusted extra root cannot follow a cache entry outside itself", (t) => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  const restoreHome = useHome(emptyHome);
+  try {
+    const outsideBundle = makePackage(join(outside, "bundle"), "cached", ["s"]);
+    const agentPlugins = join(root, "agentPlugins");
+    mkdirSync(agentPlugins, { recursive: true });
+    // installed.json pins the manifest loader to an empty list so the
+    // manifest-less fallback walk does not also run; this isolates the
+    // cache.json path under test.
+    writeFileSync(join(agentPlugins, "installed.json"), JSON.stringify({ installed: [] }));
+    // The sanitized {key} directory is a symlink that resolves outside the
+    // untrusted root, so the cache entry must not be followed.
+    try {
+      symlinkSync(
+        outsideBundle,
+        join(agentPlugins, "vscode-synced-escaping"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    writeFileSync(
+      join(agentPlugins, "cache.json"),
+      JSON.stringify([{ uri: "vscode://synced/escaping" }]),
+    );
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    const out = [];
+    try {
+      collectVscode(out, [root]);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.equal(out.some((p) => p.name === "cached"), false, "escaped cache bundle is skipped");
+    assert.ok(logs.some((line) => line.includes(agentPlugins)), "log names the untrusted root");
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("planConfig: an extra-root package still needs the mcp opt-in to contribute servers", () => {
+  const emptyHome = makeTemp("oc-home-");
+  const root = makeTemp();
+  const restoreHome = useHome(emptyHome);
+  try {
+    const agentPlugins = join(root, "agentPlugins");
+    const mcp = {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        planted: { type: "stdio", command: "npx", args: ["-y", "server"] },
+      },
+    };
+    const pkgDir = makePackage(join(agentPlugins, "pkg"), "extra-pkg", ["s"], mcp);
+    mkdirSync(agentPlugins, { recursive: true });
+    writeFileSync(
+      join(agentPlugins, "installed.json"),
+      JSON.stringify({
+        installed: [{ pluginUri: `file:///${pkgDir.replace(/\\/g, "/")}` }],
+      }),
+    );
+
+    const out = [];
+    collectVscode(out, [root]);
+    const pkg = out.find((p) => p.name === "extra-pkg");
+    assert.ok(pkg, "extra-root package discovered");
+    assert.equal(pkg.trusted, false, "extra-root manifest package is untrusted");
+
+    // The trust tier never substitutes for the explicit opt-in: without it no
+    // servers are planned...
+    assert.deepEqual(planConfig([pkg], {}, { mcp: false }).mcp, []);
+    // ...the opt-in alone isn't enough either, since the package is untrusted
+    // and nothing has consented to it...
+    assert.deepEqual(planConfig([pkg], {}, { mcp: true }).mcp, []);
+    // ...only the opt-in plus per-package consent admits it.
+    assert.deepEqual(
+      planConfig([pkg], {}, { mcp: true }, { mcp: ["extra-pkg"] }).mcp.map((m) => m.key),
+      ["planted"],
+    );
+  } finally {
+    restoreHome();
+    cleanup(emptyHome);
     cleanup(root);
   }
 });
@@ -1747,6 +2438,252 @@ test("readAgents: reads bare <name>.md files in the package root (new agency-age
     assert.equal(byName.get("README"), undefined, "README.md is not an agent");
   } finally {
     cleanup(root);
+  }
+});
+
+test("readAgents: symlinked shim AGENTS.md outside the package root contributes no outside bytes", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "legacy");
+    mkdirSync(join(pkgDir, ".claude-plugin"), { recursive: true });
+    mkdirSync(join(pkgDir, "agents", "explorer"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "legacy",
+        agents: { explorer: { description: "Explores the codebase" } },
+      }),
+    );
+    const outsideMd = join(outside, "AGENTS.md");
+    writeFileSync(outsideMd, "SECRET OUTSIDE BYTES");
+    try {
+      symlinkSync(outsideMd, join(pkgDir, "agents", "explorer", "AGENTS.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = packageFromDir(pkgDir, "node_modules");
+    assert.ok(pkg, "agents-only plugin is discovered");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "explorer");
+    assert.equal(agents[0].agent.description, "Explores the codebase");
+    // The outside file's bytes never become the prompt.
+    assert.equal(agents[0].agent.prompt, undefined);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: symlinked flat agents/<name>.md outside the package root is skipped", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    const outsideMd = join(outside, "x.md");
+    writeFileSync(outsideMd, "---\ndescription: evil\n---\nSECRET OUTSIDE BYTES");
+    try {
+      symlinkSync(outsideMd, join(pkgDir, "agents", "x.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents, []);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /resolves outside/);
+    assert.ok(logs[0].includes(pkgDir));
+    assert.ok(logs[0].includes(realpathSync(outsideMd)));
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("hasRootAgentFiles probe: a root .md symlinked outside does not make the dir a package", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const dir = join(root, "loose");
+    mkdirSync(dir, { recursive: true });
+    const outsideMd = join(outside, "x.md");
+    writeFileSync(outsideMd, "---\ndescription: evil\n---\nSECRET OUTSIDE BYTES");
+    try {
+      symlinkSync(outsideMd, join(dir, "x.md"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+    // No plugin.json and no skills: an escaping root markdown file must not be
+    // mistaken for the flat-agent layout, so the dir is not a package.
+    assert.equal(packageFromDir(dir, "claude"), null);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: in-root symlinked flat agent alias still resolves", (t) => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "agents"), { recursive: true });
+    mkdirSync(join(pkgDir, "shared"), { recursive: true });
+    writeFileSync(join(pkgDir, "plugin.json"), JSON.stringify({ $schema: SCHEMA, name: "pkg" }));
+    writeFileSync(
+      join(pkgDir, "shared", "note.md"),
+      "---\ndescription: Aliased reviewer\n---\nYou review.",
+    );
+    try {
+      symlinkSync(
+        join(pkgDir, "shared", "note.md"),
+        join(pkgDir, "agents", "alias.md"),
+        "file",
+      );
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].name, "alias");
+    assert.equal(agents[0].agent.description, "Aliased reviewer");
+    assert.equal(agents[0].agent.prompt, "You review.");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readAgents: symlinked dev.opencode/agents JSON outside the package contributes nothing", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(join(pkgDir, "dev.opencode", "agents"), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg" }),
+    );
+    const outsideJson = join(outside, "x.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({ description: "PWNED", prompt: "SECRET OUTSIDE BYTES" }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, "dev.opencode", "agents", "x.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
+
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+    assert.ok(
+      logs.some((line) => line.includes(realpathSync(outsideJson))),
+      "log names the outside target",
+    );
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: symlinked .claude-plugin/plugin.json outside the package contributes no agents", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = makePackage(root, "pkg");
+    mkdirSync(join(pkgDir, ".claude-plugin"), { recursive: true });
+    const outsideJson = join(outside, "plugin.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({
+        name: "legacy",
+        agents: { shimmed: { description: "PWNED", systemPrompt: "SECRET OUTSIDE BYTES" } },
+      }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, ".claude-plugin", "plugin.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    const agents = readAgents(pkg);
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test("readAgents: symlinked top-level plugin.json extensions outside contribute no agents", (t) => {
+  const root = makeTemp();
+  const outside = makeTemp("oc-outside-");
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    const outsideJson = join(outside, "plugin.json");
+    writeFileSync(
+      outsideJson,
+      JSON.stringify({
+        $schema: SCHEMA,
+        name: "evil",
+        extensions: {
+          "dev.opencode": {
+            agents: { helper: { description: "PWNED", prompt: "SECRET OUTSIDE BYTES" } },
+          },
+        },
+      }),
+    );
+    try {
+      symlinkSync(outsideJson, join(pkgDir, "plugin.json"), "file");
+    } catch {
+      t.skip("cannot create symlink/junction on this platform");
+      return;
+    }
+
+    const pkg = readPackage(pkgDir, "node_modules");
+    assert.ok(pkg, "readPackage still identifies the package by its manifest");
+    const agents = readAgents(pkg);
+    assert.deepEqual(agents, []);
+    assert.equal(JSON.stringify(agents).includes("SECRET OUTSIDE BYTES"), false);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
   }
 });
 

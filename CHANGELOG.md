@@ -6,8 +6,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.1.0] - Unreleased
 
+### Fixed
+
+- **Startup could block opencode for minutes on a large, unchanged Claude/VS
+  Code plugin tree.** `collectClaude`'s and `collectVscode`'s fallback walks
+  (`findPluginRoots`) always ran, and always re-read and re-parsed every
+  candidate file's frontmatter, on every single opencode launch — on a large
+  synced marketplace (tens of thousands of files) this was long enough to be
+  indistinguishable from a hang, since it fully blocks the event loop with no
+  intermediate output. Two new fingerprint-gated caches (`discovery-cache.ts`)
+  now skip re-walking and re-reading a subtree whose stat signature hasn't
+  changed since the last run: one for the whole-tree walk result, one for a
+  single package's extracted agents (the flat `*.md`-per-agent marketplace
+  layout otherwise re-reads every file per package even once the top-level
+  walk itself is cached). A cold run costs the same as before; a warm run on
+  an unchanged tree is close to instant. See `discovery-cache.test.js` and
+  `performance.test.js` for the correctness and regression-guard coverage.
+
 ### Added
 
+- **Rigorous schema validation against the published Agent Plugins schemas**,
+  not just a hand-copied field list. `plugin.json` and each `mcp.json` server
+  entry are validated with `ajv` against `plugin.schema.json`/`mcp.schema.json`
+  (vendored under `src/schemas/`, version 1.0.0 — the only version published
+  today), the plugin's first runtime dependency. This is stricter in two
+  concrete ways: a `plugin.json` with an unrecognized top-level field (the
+  spec's sanctioned place for custom data is `extensions.<namespace>`, not a
+  loose top-level key) is no longer silently accepted, and an MCP server entry
+  declaring the reserved `PLUGIN_ROOT`/`PLUGIN_DATA` env keys is now rejected
+  outright rather than having just those two keys silently dropped. A
+  `plugin.json`/`mcp.json` declaring any Agent Plugins version other than the
+  vendored 1.0.0 keeps the prior (looser) hand-rolled checks, so a future
+  1.x.x version is never rejected just because this plugin hasn't vendored
+  its schema yet. See `spec-schema.ts` and the "reserved PLUGIN_ROOT/
+  PLUGIN_DATA env keys" tests in `discovery.test.js`.
 - **Per-package `consent` option**: `consent.mcp` / `consent.agents` list
   package names whose MCP servers / agents are admitted even when the
   package is discovered as untrusted (the project's `node_modules`,
@@ -40,6 +72,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- VS Code manifests (`installed.json`, `cache.json`) discovered under a
+  user-supplied `extraRoots` entry are now untrusted, and the package roots
+  they name must resolve inside that entry. Built-in VS Code home roots keep
+  their current behavior and may still reference a global extension directory.
 - New credential-hygiene warnings for `mcp.json`: a header/env value or
   server `url` that looks credential-bearing (an `Authorization`-style
   header name, a bearer/secret-looking value, or a `user:pass@` URL) logs a

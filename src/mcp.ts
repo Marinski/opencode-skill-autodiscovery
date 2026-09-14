@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "./log.js";
 import { MCP_SCHEMA, VERSION, validateName } from "./schema.js";
+import { MCP_SCHEMA_1_0_0_ID, validateMcpServerEntry } from "./spec-schema.js";
 import type { PluginPackage } from "./discovery.js";
 
 export type McpEntry =
@@ -176,6 +177,23 @@ export function readMcp(
       continue;
     }
     const server = serverValue as Record<string, unknown>;
+
+    // Rigorous structural validation against the real published schema, when
+    // this plugin has vendored a copy matching the declared version (today,
+    // only 1.0.0) — see spec-schema.ts. This is what actually closes the gap
+    // the STDIO_KEYS/HTTP_KEYS checks below leave open: a field the real
+    // schema forbids but nobody thought to add to a hand-copied key set
+    // silently passes them. dodopayments/dodo-agent-plugin#13 hit exactly
+    // this with a stray `enabled` key. Any other conformant 1.x.x version
+    // this plugin hasn't vendored a schema for still relies on those checks
+    // below, so a future minor version is never rejected outright.
+    if (parsed.$schema === MCP_SCHEMA_1_0_0_ID) {
+      const result = validateMcpServerEntry(server);
+      if (!result.valid) {
+        log(`skipping MCP server "${pkg.name}/${name}": ${result.errors.join("; ")}`);
+        continue;
+      }
+    }
 
     if (server.type === "stdio") {
       if (hasUnknownKeys(server, STDIO_KEYS)) {

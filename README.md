@@ -213,7 +213,10 @@ deliberately, vouched for by a manifest:
 - the project's `node_modules`: dependencies install transitively, so anything
   in the tree can ship skills, MCP servers, or agents. Scanning it is **off by
   default**; restore it explicitly with `"scanNodeModules": true`.
-- user-supplied `extraRoots`: the plugin cannot vouch for whatever you point it at.
+- user-supplied `extraRoots`: the plugin cannot vouch for whatever you point
+  it at. A manifest discovered under one of these roots is untrusted and may
+  only reference a package inside that root (a trusted VS Code home root may
+  still reference a global extension directory).
 - manifest-less directory walks (e.g. cloned-but-uninstalled marketplace folders).
 
 ### Graduated default
