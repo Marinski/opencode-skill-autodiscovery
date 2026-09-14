@@ -84,7 +84,7 @@ test("config hook: discovers an Agent Plugins package in the project node_module
   assert.equal(cfg.mcp, undefined);
 });
 
-test("config hook: registers MCP only when the mcp option is enabled", async () => {
+test("config hook: registers MCP only when mcp is enabled and the package is consented", async () => {
   makePackage(join(envRoot, "node_modules", "dotest2"), "dotest2", ["s"], {
     $schema: MCP_SCHEMA_URL,
     mcpServers: {
@@ -93,9 +93,43 @@ test("config hook: registers MCP only when the mcp option is enabled", async () 
   });
   const off = await runHook({ scanNodeModules: true });
   assert.equal(off.mcp, undefined);
-  const on = await runHook({ scanNodeModules: true, mcp: true });
+  // mcp:true alone is not enough for an untrusted package: the trust gate
+  // admits it only when the package name is listed in consent.mcp.
+  const gated = await runHook({ scanNodeModules: true, mcp: true });
+  assert.equal(gated.mcp, undefined, "untrusted package skipped without consent");
+  const on = await runHook({
+    scanNodeModules: true,
+    mcp: true,
+    consent: { mcp: ["dotest2"] },
+  });
   assert.equal(on.mcp.srv.type, "remote");
   assert.equal(on.mcp.srv.url, "https://api.example.com/mcp");
+});
+
+test("config hook: consent admits an untrusted package's MCP servers", async () => {
+  makePackage(join(envRoot, "node_modules", "consenttest"), "consenttest", ["s"], {
+    $schema: MCP_SCHEMA_URL,
+    mcpServers: {
+      srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
+    },
+  });
+  // Consent gates MCP registration for untrusted packages: with the switch
+  // on and the package listed, servers register; with the switch off,
+  // consent alone enables nothing.
+  const on = await runHook({
+    scanNodeModules: true,
+    mcp: true,
+    agents: true,
+    consent: { mcp: ["consenttest"], agents: ["consenttest"] },
+  });
+  assert.ok(
+    on.skills.paths.some((p) => p.includes("consenttest")),
+    "package still discovered with consent present",
+  );
+  assert.equal(on.mcp.srv.type, "remote", "consented package's servers register");
+  const off = await runHook({ consent: { mcp: ["consenttest"] } });
+  assert.equal(off.mcp, undefined, "consent without the mcp switch enables nothing");
+  assert.equal(off.agent, undefined, "consent without the agents switch enables nothing");
 });
 
 test("config hook: does not overwrite a user-defined command", async () => {
@@ -109,7 +143,7 @@ test("config hook: does not overwrite a user-defined command", async () => {
   assert.equal(cfg.command.custom.template, "user template");
 });
 
-test("config hook: registers agents only when the agents option is enabled", async () => {
+test("config hook: registers agents only when the agents option is enabled and the package is consented", async () => {
   const pkgDir = join(envRoot, "node_modules", "dotest4");
   mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
   writeFileSync(
@@ -136,10 +170,71 @@ test("config hook: registers agents only when the agents option is enabled", asy
   );
   const off = await runHook({ scanNodeModules: true });
   assert.equal(off.agent, undefined);
-  const on = await runHook({ scanNodeModules: true, agents: true });
-  assert.ok(on.agent.reviewer, "agent registered when agents:true");
+  const gated = await runHook({ scanNodeModules: true, agents: true });
+  assert.equal(
+    gated.agent,
+    undefined,
+    "untrusted package skipped without consent.agents",
+  );
+  const on = await runHook({
+    scanNodeModules: true,
+    agents: true,
+    consent: { agents: ["dotest4"] },
+  });
+  assert.ok(on.agent.reviewer, "agent registered when agents:true and consented");
   assert.equal(on.agent.reviewer.description, "Reviews diffs");
   assert.equal(on.agent.reviewer.permission, undefined, "permission stripped");
+});
+
+test("config hook: agent tools from a consented package are dropped with a merge-time warning naming package and agent", async () => {
+  const pkgDir = join(envRoot, "node_modules", "toolgrant");
+  mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "s", "SKILL.md"),
+    "---\nname: s\n---\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "toolgrant",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            reviewer: {
+              description: "Reviews diffs",
+              prompt: "You review code",
+              tools: { bash: true, write: true },
+            },
+          },
+        },
+      },
+    }),
+  );
+
+  const logs = [];
+  const origError = console.error;
+  console.error = (...args) => logs.push(args.map(String).join(" "));
+  let cfg;
+  try {
+    cfg = await runHook({
+      scanNodeModules: true,
+      agents: true,
+      consent: { agents: ["toolgrant"] },
+    });
+  } finally {
+    console.error = origError;
+  }
+
+  // The agent is admitted, minus its declared tools grant...
+  assert.ok(cfg.agent.reviewer, "consented agent registers");
+  assert.equal("tools" in cfg.agent.reviewer, false, "tools grant never reaches config");
+  // ...and the drop warning appears in the hook's merge output, naming the
+  // agent and the package that supplied it.
+  const drop = logs.find((line) => line.includes("dropping tools"));
+  assert.ok(drop, "tools-drop warning appears in the merge summary");
+  assert.match(drop, /agent "reviewer"/);
+  assert.match(drop, /package "toolgrant"/);
 });
 
 test("config hook: project node_modules is not scanned unless scanNodeModules is true", async () => {
@@ -241,10 +336,60 @@ test("config hook: opencode plugin cache is not scanned unless scanCache is true
   );
 });
 
+test("config hook: trusted opencode-cache package registers MCP server and agent without consent", async () => {
+  // opencode installs npm plugins into its own cache, so cache packages are
+  // host-vouched (trusted). The trust gate must not require consent for them:
+  // mcp:true / agents:true alone admit their servers and agents.
+  const pkgDir = join(
+    envRoot,
+    ".cache",
+    "opencode",
+    "packages",
+    "trustedcache@1.0.0",
+    "node_modules",
+    "trustedcache",
+  );
+  mkdirSync(join(pkgDir, "skills", "s"), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "skills", "s", "SKILL.md"),
+    "---\nname: s\ndescription: s\n---\n# s\n",
+  );
+  writeFileSync(
+    join(pkgDir, "plugin.json"),
+    JSON.stringify({
+      $schema: SCHEMA,
+      name: "trustedcache",
+      extensions: {
+        "dev.opencode": {
+          agents: {
+            reviewer: { description: "Reviews diffs", prompt: "You review code" },
+          },
+        },
+      },
+    }),
+  );
+  writeFileSync(
+    join(pkgDir, "mcp.json"),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        srv: { type: "streamable-http", url: "https://api.example.com/mcp" },
+      },
+    }),
+  );
+
+  const on = await runHook({ scanCache: true, mcp: true, agents: true });
+  assert.ok(on.agent.reviewer, "trusted cache package's agent registers without consent");
+  assert.equal(on.agent.reviewer.description, "Reviews diffs");
+  assert.equal(on.mcp.srv.type, "remote", "trusted cache package's MCP server registers without consent");
+  assert.equal(on.mcp.srv.enabled, false, "package-supplied MCP entry still defaults to enabled:false");
+});
+
 test("config hook: no plugin-data directory without flags or with an unparseable mcp.json", async () => {
-  // FS snapshot: readMcp's stdio branch is the only code path that creates
-  // {state}/opencode/plugin-data/{pkg}, and it must do so only when the mcp
-  // flag is enabled AND mcp.json parsed successfully.
+  // FS snapshot: applyConfigPatch's mcp branch is the only code path that
+  // creates {state}/opencode/plugin-data/{pkg} (never at plan time), and it
+  // runs only when the mcp flag is enabled AND a stdio server was actually
+  // planned from a parsed mcp.json.
   const pluginDataRoot = join(envRoot, ".local", "state", "opencode", "plugin-data");
 
   // Package carrying every component type (skill, agent, valid stdio

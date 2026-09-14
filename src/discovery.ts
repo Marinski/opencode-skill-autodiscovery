@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -12,7 +13,7 @@ import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
 import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
 import type { AgentConfig } from "./agents.js";
-import type { McpEntry } from "./mcp.js";
+import type { McpEntry, McpPlanEntry } from "./mcp.js";
 
 export { readAgents } from "./agents.js";
 export type { AgentConfig } from "./agents.js";
@@ -47,9 +48,18 @@ export type SkillInfo = { dir: string; name: string; description: string };
 
 export type ConfigPatch = {
   skillPaths: string[];
-  commands: Array<{ name: string; description: string; template: string }>;
-  mcp: Array<{ key: string; entry: McpEntry }>;
-  agents: Array<{ name: string; agent: AgentConfig }>;
+  // Parallel to skillPaths: per-path provenance (the owning package's
+  // `trusted` flag) so registration code can tell deliberate installs from
+  // side-effect discovery.
+  skillTrust: Array<{ dir: string; trusted: boolean }>;
+  commands: Array<{
+    name: string;
+    description: string;
+    template: string;
+    trusted: boolean;
+  }>;
+  mcp: Array<{ key: string; entry: McpEntry; trusted: boolean }>;
+  agents: Array<{ name: string; agent: AgentConfig; trusted: boolean }>;
 };
 
 export type ConfigLike = {
@@ -706,15 +716,31 @@ export function planConfig(
   // skipped entirely — no mcp.json parsing, no filesystem side effects.
   // Same for agents: when agents is false readAgents is never invoked.
   enabled: { mcp?: boolean; agents?: boolean } = {},
+  // Per-package consent for untrusted packages: a package discovered as a
+  // side effect contributes nothing to plan.mcp or plan.agents unless its
+  // name is listed in the matching consent list.
+  consent: { mcp?: Iterable<string>; agents?: Iterable<string> } = {},
 ): ConfigPatch {
   packages = dedupePackages(packages);
   const skillPaths: string[] = [];
+  const skillTrust: ConfigPatch["skillTrust"] = [];
   const seenDir = new Set<string>();
   for (const pkg of packages) {
+    // Graduated default, permissive half: skills and slash commands are
+    // read-only content registration and stay allowed for every trust tier —
+    // surfacing them is the plugin's job. An untrusted package registers
+    // exactly like a trusted one, but emits one info line so side-effect
+    // content entering the session stays visible to the user.
+    if (!pkg.trusted && pkg.skillDirs.length > 0) {
+      log(
+        `registering skills and slash commands for untrusted package "${pkg.name}" (${pkg.source})`,
+      );
+    }
     for (const dir of pkg.skillDirs) {
       if (seenDir.has(dir)) continue;
       seenDir.add(dir);
       skillPaths.push(dir);
+      skillTrust.push({ dir, trusted: pkg.trusted });
     }
   }
 
@@ -764,18 +790,48 @@ export function planConfig(
           `Load the ${JSON.stringify(info.name)} skill and follow its instructions.`,
           `Context: $ARGUMENTS`,
         ].join("\n"),
+        trusted: pkg.trusted,
       });
     }
   }
 
   const mcp: ConfigPatch["mcp"] = [];
   if (enabled.mcp !== false) {
+    const consentedMcp = new Set(consent.mcp ?? []);
     const usedMcp = new Set(taken.mcp ?? []);
     const mcpOwner = new Map<string, PackageSource | "user">();
     for (const name of taken.mcp ?? []) mcpOwner.set(name, "user");
     const seenMcpEntry = new Set<string>();
     for (const pkg of packages) {
-      const entries: Array<{ key: string; entry: McpEntry }> = [];
+      // Trust gate: MCP servers are both powerful and opaque to opencode.
+      // Untrusted packages are present merely as side effects, so they never
+      // contribute servers unless the user consented to the package by name.
+      // Host-vouched installs (trusted: true) pass through unchanged.
+      if (!pkg.trusted && !consentedMcp.has(pkg.name)) {
+        // Slice the credential signal out of the untrusted package's mcp.json
+        // so entries carrying headers/env/url credentials get a per-entry
+        // refusal line. readMcp runs with warnings off: a refused credential
+        // must never be told it "will be stored in opencode's config".
+        if (pkg.mcpPath) {
+          const entries: McpPlanEntry[] = [];
+          readMcp(pkg, entries, { warn: false });
+          let named = 0;
+          for (const { key, credentialReason } of entries) {
+            if (!credentialReason) continue;
+            named++;
+            log(
+              `skipping MCP server "${pkg.name}/${key}" (${pkg.source}): ${credentialReason}; add it to consent.mcp to admit its servers`,
+            );
+          }
+          if (named === 0) {
+            log(
+              `skipping MCP server for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.mcp to admit its servers`,
+            );
+          }
+        }
+        continue;
+      }
+      const entries: McpPlanEntry[] = [];
       readMcp(pkg, entries);
       for (const { key, entry } of entries) {
         const dedupeKey = `${pkg.root}\u0000${key}`;
@@ -794,19 +850,35 @@ export function planConfig(
         }
         mcpOwner.set(k, pkg.source);
         usedMcp.add(k);
-        mcp.push({ key: k, entry });
+        mcp.push({ key: k, entry, trusted: pkg.trusted });
       }
     }
   }
 
   const agents: ConfigPatch["agents"] = [];
   if (enabled.agents !== false) {
+    const consentedAgents = new Set(consent.agents ?? []);
     const usedAgents = new Set(taken.agents ?? []);
     const agentOwner = new Map<string, PackageSource | "user">();
     for (const name of taken.agents ?? []) agentOwner.set(name, "user");
     const seenAgent = new Set<string>();
     for (const pkg of packages) {
-      for (const { name, agent } of readAgents(pkg)) {
+      // Trust gate: agents are prompt-and-behavior material that a package
+      // registers into opencode config slots. Untrusted packages are present
+      // merely as side effects, so they contribute agents only when the user
+      // consented to the package by name. Host-vouched installs (trusted:
+      // true) pass through. Note the readAgents call is hoisted so name
+      // validation logs behave identically for every admitted package.
+      const pkgAgents = readAgents(pkg);
+      if (!pkg.trusted && !consentedAgents.has(pkg.name)) {
+        if (pkgAgents.length > 0) {
+          log(
+            `skipping agents for untrusted package "${pkg.name}" (${pkg.source}): add it to consent.agents to admit its agents`,
+          );
+        }
+        continue;
+      }
+      for (const { name, agent } of pkgAgents) {
         const dedupeKey = `${pkg.root}\u0000${name}`;
         if (seenAgent.has(dedupeKey)) continue;
         seenAgent.add(dedupeKey);
@@ -823,12 +895,12 @@ export function planConfig(
         }
         agentOwner.set(agentName, pkg.source);
         usedAgents.add(agentName);
-        agents.push({ name: agentName, agent });
+        agents.push({ name: agentName, agent, trusted: pkg.trusted });
       }
     }
   }
 
-  return { skillPaths, commands, mcp, agents };
+  return { skillPaths, skillTrust, commands, mcp, agents };
 }
 
 // Applies a computed plan to the resolved config. Never overwrites user-defined
@@ -875,6 +947,16 @@ export function applyConfigPatch(
     for (const { key, entry } of plan.mcp) {
       if (config.mcp[key]) continue;
       config.mcp[key] = entry;
+      // A package stdio server runs with PLUGIN_DATA pointing at its data
+      // dir. The dir is created only here, when the server is actually
+      // applied -- never at plan time, so planning leaves no trace on disk.
+      if (entry.type === "local" && entry.environment?.PLUGIN_DATA) {
+        try {
+          mkdirSync(entry.environment.PLUGIN_DATA, { recursive: true });
+        } catch {
+          // Non-fatal: the subprocess env still points at the (uncreated) dir.
+        }
+      }
     }
   }
 
