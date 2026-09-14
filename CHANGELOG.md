@@ -4,10 +4,7 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] - Unreleased
-
-This release contains a breaking change, so the major version is bumped from
-1.x to 2.0.0.
+## [2.1.0] - Unreleased
 
 ### Fixed
 
@@ -44,6 +41,18 @@ This release contains a breaking change, so the major version is bumped from
   its schema yet. See `spec-schema.ts` and the "reserved PLUGIN_ROOT/
   PLUGIN_DATA env keys" tests in `discovery.test.js`.
 
+### Security
+
+- VS Code manifests (`installed.json`, `cache.json`) discovered under a
+  user-supplied `extraRoots` entry are now untrusted, and the package roots
+  they name must resolve inside that entry. Built-in VS Code home roots keep
+  their current behavior and may still reference a global extension directory.
+
+## [2.0.0] - 2026-08-24
+
+This release contains a breaking change, so the major version is bumped from
+1.x to 2.0.0.
+
 ### Changed
 
 - **Breaking:** behavioral change to discovery defaults. `scanNodeModules` and
@@ -63,9 +72,6 @@ This release contains a breaking change, so the major version is bumped from
   `extraRoots`, and manifest-less walks are untrusted. The README also states
   that enabling `mcp` or `agents` trusts every discovered package with matching
   executable config, and recommends pairing those flags with `exclude`.
-- VS Code manifests (`installed.json`, `cache.json`) discovered under a
-  user-supplied `extraRoots` entry are now untrusted, and the package roots
-  they name must resolve inside that entry. Built-in VS Code home roots keep
-  their current behavior and may still reference a global extension directory.
 
+[2.1.0]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v1.4.0...v2.0.0
