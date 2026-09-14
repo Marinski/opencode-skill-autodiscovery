@@ -23,4 +23,12 @@ jobs:
       - run: npm ci
       - run: npm test
 
+      # Node 22's bundled npm (10.x) predates OIDC trusted publishing support
+      # (npm 11.5.1+): with it, `npm publish` never attempts the OIDC
+      # handshake at all and just publishes unauthenticated, which the
+      # registry rejects with a generic 404 (it won't reveal whether the
+      # package exists to an unauthorized caller) rather than a real
+      # permissions error — indistinguishable from "package doesn't exist"
+      # until you check the npm version actually running here.
+      - run: npm install -g npm@latest
       - run: npm publish --provenance --access public
