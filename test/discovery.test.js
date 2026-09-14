@@ -203,7 +203,30 @@ test("readPackage: rejects missing manifest, bad JSON, bad $schema, missing name
   }
 });
 
-test("readPackage: unknown top-level fields are ignored", () => {
+test("readPackage: a stray top-level field (not the extensions namespace) fails the real schema, not silently ignored", () => {
+  // Agent Plugins 1.0.0's published plugin.schema.json has
+  // additionalProperties: false at the document root — a manifest carrying
+  // an unrecognized top-level key is not conformant, full stop; the spec's
+  // sanctioned place for client-specific data is `extensions.<namespace>`
+  // (covered by the next test). readPackage rejects it (returns null) rather
+  // than silently treating a non-conformant manifest as valid; the caller's
+  // existing legacy-discovery fallback still applies, so this never breaks a
+  // real package, it just stops mis-trusting an invalid manifest.
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: SCHEMA, name: "pkg", mystery: { anything: true } }),
+    );
+    assert.equal(readPackage(pkgDir, "node_modules"), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readPackage: client-specific data belongs under extensions.<namespace>, which the real schema allows", () => {
   const root = makeTemp();
   try {
     const pkgDir = join(root, "pkg");
@@ -213,7 +236,6 @@ test("readPackage: unknown top-level fields are ignored", () => {
       JSON.stringify({
         $schema: SCHEMA,
         name: "pkg",
-        mystery: { anything: true },
         extensions: { "com.example.client": { setting: 1 } },
       }),
     );
@@ -896,6 +918,56 @@ test("readMcp: missing or mismatched $schema disables MCP for the package", () =
     const out = [];
     readMcp(pkg, out);
     assert.equal(out.length, 0);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: a 1.0.0 stdio entry declaring the reserved PLUGIN_ROOT/PLUGIN_DATA env keys is rejected outright by the real schema", () => {
+  // The published mcp.schema.json's env sub-schema forbids these two names
+  // via propertyNames — a stricter behavior than the old hand-rolled path
+  // (see the fallback-version test below), which just dropped the reserved
+  // key and kept the rest of the entry. For a package declaring exactly
+  // 1.0.0 this plugin now defers to the real schema: the whole entry is
+  // invalid, not just that one key, so it is skipped and logged rather than
+  // silently modified and kept.
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: { srv: { type: "stdio", command: "npx", env: { PLUGIN_ROOT: "haha" } } },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+    const out = [];
+    readMcp(pkg, out);
+    assert.equal(out.length, 0, "the whole entry is rejected, not silently modified");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("readMcp: for a conformant version this plugin hasn't vendored a schema for, the reserved env key is still just dropped (fallback behavior preserved)", () => {
+  const root = makeTemp();
+  try {
+    const pkgDir = join(root, "pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    const version = "https://agent-plugins.org/schemas/1.1.0";
+    writeFileSync(
+      join(pkgDir, "plugin.json"),
+      JSON.stringify({ $schema: `${version}/plugin.schema.json`, name: "pkg" }),
+    );
+    writeFileSync(
+      join(pkgDir, "mcp.json"),
+      JSON.stringify({
+        $schema: `${version}/mcp.schema.json`,
+        mcpServers: { srv: { type: "stdio", command: "npx", env: { PLUGIN_ROOT: "haha" } } },
+      }),
+    );
+    const pkg = readPackage(pkgDir, "node_modules");
+    const out = [];
+    readMcp(pkg, out);
+    assert.equal(out.length, 1, "the entry survives via the fallback (non-ajv) path");
+    assert.equal(out[0].entry.environment.PLUGIN_ROOT, pkgDir, "the real PLUGIN_ROOT wins, not the package's spoofed value");
   } finally {
     cleanup(root);
   }

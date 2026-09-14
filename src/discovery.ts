@@ -8,7 +8,10 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cachedRead } from "./cache.js";
+import { getCachedPackages, setCachedPackages, fingerprintTree } from "./discovery-cache.js";
 import { log, sanitize } from "./log.js";
+import { PLUGIN_SCHEMA_1_0_0_ID, validatePluginManifest } from "./spec-schema.js";
 import { readAgents } from "./agents.js";
 import { readMcp } from "./mcp.js";
 import { NAME_PATTERN, PLUGIN_SCHEMA, VERSION, validateName } from "./schema.js";
@@ -121,12 +124,19 @@ export function resolveContained(root: string, candidate: string): string | null
 // when the file is unreadable or lacks a valid `name`.
 export function readSkillInfo(dir: string): SkillInfo | null {
   const skillMd = join(dir, "SKILL.md");
-  let content: string;
+  let parsed: { name: string; description: string } | null;
   try {
-    content = readFileSync(skillMd, "utf8");
+    parsed = cachedRead("skill-frontmatter", skillMd, parseSkillFrontmatter);
   } catch {
     return null;
   }
+  if (!parsed) return null;
+  return { dir, name: parsed.name, description: parsed.description };
+}
+
+function parseSkillFrontmatter(
+  content: string,
+): { name: string; description: string } | null {
   const frontmatter = /^---\s*\n([\s\S]*?)\n---/.exec(content)?.[1];
   if (!frontmatter) return null;
   const field = (key: string): string | undefined => {
@@ -138,7 +148,7 @@ export function readSkillInfo(dir: string): SkillInfo | null {
   if (!name) return null;
   // The description is written into config verbatim: strip ANSI escapes and
   // C0 control characters before it can reach any config surface.
-  return { dir, name, description: sanitize(field("description") ?? "") };
+  return { name, description: sanitize(field("description") ?? "") };
 }
 
 // Reads a conformant Agent Plugins 1.0.0 package from a directory root.
@@ -156,7 +166,7 @@ export function readPackage(
   if (!isRegularFile(manifestPath)) return null;
   let manifest: { $schema?: unknown; name?: unknown };
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest = cachedRead("plugin-manifest", manifestPath, (content) => JSON.parse(content));
   } catch {
     return null;
   }
@@ -164,7 +174,20 @@ export function readPackage(
   if (typeof manifest.$schema !== "string" || !PLUGIN_SCHEMA.test(manifest.$schema)) {
     return null;
   }
-  if (
+  // Rigorous structural validation against the real published schema, when
+  // this plugin has vendored a copy matching the declared version (today,
+  // only 1.0.0). Any other conformant 1.x.x version falls back to the
+  // name-only check below, so a future minor version is never rejected just
+  // because this plugin hasn't vendored its schema yet — see spec-schema.ts.
+  if (manifest.$schema === PLUGIN_SCHEMA_1_0_0_ID) {
+    const result = validatePluginManifest(manifest);
+    if (!result.valid) {
+      log(
+        `ignoring plugin.json at "${root}": fails Agent Plugins 1.0.0 schema (${result.errors.join("; ")})`,
+      );
+      return null;
+    }
+  } else if (
     typeof manifest.name !== "string" ||
     manifest.name.length === 0 ||
     manifest.name.length > 64 ||
@@ -172,6 +195,11 @@ export function readPackage(
   ) {
     return null;
   }
+  // Narrows `manifest.name` for TS: always true here (either branch above
+  // already guarantees it — ajv's `name` schema requires a string, the
+  // fallback branch checked it directly) but ajv validation doesn't carry
+  // type-level narrowing the way the explicit typeof check does.
+  if (typeof manifest.name !== "string") return null;
 
   const skillDirs: string[] = [];
   const skillsRoot = join(root, "skills");
@@ -331,10 +359,18 @@ function hasRootAgentFiles(root: string): boolean {
     if (!e.endsWith(".md")) return false;
     const contained = resolveContained(root, join(root, e));
     if (!contained || !isRegularFile(contained)) return false;
-    const m = /^---\s*\n([\s\S]*?)\n---/.exec(readFileSync(contained, "utf8"))?.[1];
-    if (!m) return false;
-    return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
+    try {
+      return cachedRead("agent-frontmatter-check", contained, hasAgentFrontmatter);
+    } catch {
+      return false;
+    }
   });
+}
+
+function hasAgentFrontmatter(content: string): boolean {
+  const m = /^---\s*\n([\s\S]*?)\n---/.exec(content)?.[1];
+  if (!m) return false;
+  return /^name:[ \t]/.test(m) || /^description:[ \t]/.test(m);
 }
 
 // Returns directories under `root` that are individual plugin roots. This
@@ -357,6 +393,37 @@ export function findPluginRoots(root: string, out: string[]): void {
     return;
   }
   findPluginRootsUnder(resolved, resolved, out, new Set());
+}
+
+// Equivalent to a caller doing `findPluginRoots(root, roots)` and converting
+// each hit with `packageFromDir(pluginRoot, source, trusted)` — the exact
+// pattern collectAgentPluginRoot's fallback and collectClaude's remote walk
+// both used before discovery-cache.ts existed — except a cheap fingerprint
+// check of `root` (see fingerprintTree) can skip the real walk, and every
+// file read inside it, entirely when the subtree hasn't changed since the
+// last run. A miss falls back to exactly the walk+convert callers did
+// before, so this is never slower than the un-cached baseline.
+//
+// `exclude` is deliberately the caller's job, applied identically on a hit
+// or a miss, so changing the exclude list never has to invalidate the cache.
+function findPluginPackagesCached(
+  root: string,
+  source: PackageSource,
+  trusted: boolean,
+): PluginPackage[] {
+  const fingerprint = fingerprintTree(root);
+  const key = JSON.stringify([source, root]);
+  const cached = getCachedPackages(key, fingerprint);
+  if (cached) return cached;
+  const roots: string[] = [];
+  findPluginRoots(root, roots);
+  const packages: PluginPackage[] = [];
+  for (const pluginRoot of roots) {
+    const pkg = packageFromDir(pluginRoot, source, trusted);
+    if (pkg) packages.push(pkg);
+  }
+  setCachedPackages(key, fingerprint, packages);
+  return packages;
 }
 
 function findPluginRootsUnder(
@@ -406,7 +473,11 @@ function hasClaudeAgents(root: string): boolean {
   );
   if (!manifestPath) return false;
   try {
-    const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const manifest: unknown = cachedRead(
+      "claude-legacy-manifest",
+      manifestPath,
+      (content) => JSON.parse(content),
+    );
     if (typeof manifest !== "object" || manifest === null) return false;
     const agents = (manifest as Record<string, unknown>).agents;
     return (
@@ -688,11 +759,8 @@ function collectAgentPluginRoot(
   // clone) has no manifest entry at all. Only suppress the walk when
   // installed.json exists, so any clone actually on disk is still discovered.
   if (!existsSync(installedJson)) {
-    const pluginRoots: string[] = [];
-    findPluginRoots(root, pluginRoots);
-    for (const pluginRoot of pluginRoots) {
-      const pkg = packageFromDir(pluginRoot, "vscode", false);
-      if (pkg && !isExcluded(pkg, exclude)) out.push(pkg);
+    for (const pkg of findPluginPackagesCached(root, "vscode", false)) {
+      if (!isExcluded(pkg, exclude)) out.push(pkg);
     }
   }
 }

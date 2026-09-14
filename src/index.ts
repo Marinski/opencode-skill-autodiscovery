@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import type { Plugin, Config } from "@opencode-ai/plugin";
+import { flushFileCache } from "./cache.js";
+import { flushDiscoveryCache } from "./discovery-cache.js";
 import {
   applyConfigPatch,
   collectClaude,
@@ -77,6 +79,13 @@ export default (async (_input, options) => {
       );
 
       applyConfigPatch(config, plan, { mcp: mcpEnabled, agents: agentsEnabled });
+      // Persist both cache layers this scan may have written: the per-file
+      // content cache (cache.ts) and the whole-root walk-skip cache
+      // (discovery-cache.ts). Both are best-effort and never throw — an
+      // unchanged tree on the next opencode startup skips re-reading files
+      // via the first, and skips re-walking entirely via the second.
+      flushFileCache();
+      flushDiscoveryCache();
     },
   };
 }) satisfies Plugin;

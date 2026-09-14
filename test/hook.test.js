@@ -1,6 +1,6 @@
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import plugin from "../dist/index.js";
@@ -362,4 +362,98 @@ test("config hook: non-string extraRoots/exclude entries are filtered per-entry"
     (p) => p.endsWith("skills\\xs") || p.endsWith("skills/xs"),
   );
   assert.equal(found.length, 1, "one skill path from the valid extra root");
+});
+
+test("config hook: a flat agent .md is discovered identically on a warm cache, and an edit is picked up on the next run (no staleness)", async () => {
+  // Regression test for a real collision: hasRootAgentFiles (a boolean
+  // "does this .md carry agent frontmatter" check, run for every directory
+  // the walk visits) and readAgents (the full parsed agent, run once per
+  // discovered package) both read the *same* flat agent-file layout
+  // (engineering/*.md) — the layout this repo's own opencode.jsonc
+  // extraRoots scan hits on ~/.claude/remote/plugins. Without namespacing the
+  // file cache by which of the two is reading, the second reader would get
+  // back the first reader's cached boolean instead of a real parse.
+  // Legacy flat-agent layout (no plugin.json) is only found through
+  // collectVscode's extraRoots -> {root}/agent-plugins/{name} convention —
+  // collectNodeModules only reads conformant (plugin.json) packages, so this
+  // has to go through extraRoots to exercise the same code path the real
+  // ~/.claude/remote/plugins walk uses on the host that hit this bug.
+  const pkgDir = join(envRoot, "extraflat", "agent-plugins", "flatagents");
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    join(pkgDir, "cache-regression-reviewer.md"),
+    "---\nname: Reviewer\ndescription: Reviews things\n---\nYou review things.",
+  );
+
+  const opts = { extraRoots: ["extraflat"], agents: true };
+  const first = await runHook(opts);
+  assert.equal(first.agent["cache-regression-reviewer"].description, "Reviews things");
+  assert.equal(first.agent["cache-regression-reviewer"].prompt, "You review things.");
+
+  // Second run against the same, unchanged file: must reuse the file cache
+  // and still produce the exact same (correct, non-boolean) parsed agent —
+  // not the collision bug's leaked `true`.
+  const second = await runHook(opts);
+  assert.deepEqual(
+    second.agent["cache-regression-reviewer"],
+    first.agent["cache-regression-reviewer"],
+  );
+
+  // Edit the file's content: a cached-but-live source must reflect this on
+  // the very next run, with no staleness window.
+  writeFileSync(
+    join(pkgDir, "cache-regression-reviewer.md"),
+    "---\nname: Reviewer\ndescription: Reviews things, now more thoroughly\n---\nYou review things very carefully.",
+  );
+  const third = await runHook(opts);
+  assert.equal(
+    third.agent["cache-regression-reviewer"].description,
+    "Reviews things, now more thoroughly",
+  );
+  assert.equal(
+    third.agent["cache-regression-reviewer"].prompt,
+    "You review things very carefully.",
+  );
+});
+
+test("config hook: the whole-root discovery cache is populated by a real scan and reflects an added package on the next run", async () => {
+  // Integration coverage for discovery-cache.ts's wiring into
+  // collectAgentPluginRoot's fallback walk (the same code path
+  // collectClaude's remote-plugins walk uses): not just that the cache
+  // module is internally correct in isolation, but that a real hook run
+  // actually populates and consults it.
+  const marketRoot = join(envRoot, "rootcache", "agent-plugins", "onepkg");
+  mkdirSync(marketRoot, { recursive: true });
+  writeFileSync(
+    join(marketRoot, "first.md"),
+    "---\nname: First\ndescription: First agent\n---\nBody one.",
+  );
+
+  const opts = { extraRoots: ["rootcache"], agents: true };
+  const first = await runHook(opts);
+  assert.ok(first.agent["first"], "the fixture package is actually discovered");
+
+  const cacheFile = join(
+    envRoot,
+    ".cache",
+    "opencode-skill-autodiscovery",
+    "discovery-root-cache.json",
+  );
+  assert.ok(existsSync(cacheFile), "a real hook run must populate the whole-root cache file");
+  const cached = JSON.parse(readFileSync(cacheFile, "utf8"));
+  const entry = Object.values(cached.entries).find(
+    (e) => Array.isArray(e.value) && e.value.some((p) => p.name === "onepkg"),
+  );
+  assert.ok(entry, "the discovered package is recorded under its scanned root");
+
+  // Add a second flat-agent file to the same package root: the subtree
+  // fingerprint must change, so the next run picks up the new agent rather
+  // than replaying the first run's cached (now stale) package list.
+  writeFileSync(
+    join(marketRoot, "second.md"),
+    "---\nname: Second\ndescription: Second agent\n---\nBody two.",
+  );
+  const second = await runHook(opts);
+  assert.ok(second.agent["first"], "the original agent is still discovered");
+  assert.ok(second.agent["second"], "the newly added agent is discovered on the next run");
 });
