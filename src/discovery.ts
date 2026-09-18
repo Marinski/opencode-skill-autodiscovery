@@ -47,6 +47,16 @@ export type PluginPackage = {
   mcpPath?: string;
   /** Agent Plugins version declared by plugin.json, e.g. "1.0.0". */
   schemaVersion?: string;
+  /**
+   * True when `name` was read from a real plugin manifest (Agent Plugins
+   * schema or a native Claude Code `.claude-plugin/plugin.json`), so it is
+   * the plugin's own declared identity rather than a directory-basename
+   * fallback. dedupePackages only collapses mirrors discovered at different
+   * physical paths when this is true — trusting a bare basename the same
+   * way would risk merging two unrelated packages that happen to share a
+   * generic directory name.
+   */
+  manifestName: boolean;
 };
 
 export type SkillInfo = { dir: string; name: string; description: string };
@@ -256,6 +266,7 @@ export function readPackage(
     skillDirs,
     mcpPath,
     schemaVersion: VERSION.exec(manifest.$schema)?.[1],
+    manifestName: true,
   };
 }
 
@@ -500,6 +511,39 @@ function hasClaudeAgents(root: string): boolean {
   }
 }
 
+// Reads the `name` declared by a legacy Claude Code manifest
+// (.claude-plugin/plugin.json without a recognized $schema — the native
+// Claude Code shape, which is what every plugin actually installed via
+// Claude Code ships). readPackage() only trusts a manifest name when
+// $schema is present and matches the Agent Plugins spec, so a plugin
+// installed the native way falls through to packageFromDir's legacy tree
+// walk; without this, that walk names the package after its directory
+// basename instead, which differs at every physical location the same
+// plugin is mirrored to (a top-level clone, the same clone nested again
+// inside a bundled marketplace tree, an SSH-synced remote copy, ...) and
+// defeats dedupePackages entirely, registering every skill in the plugin
+// once per mirror. Shares the "claude-legacy-manifest" cache key with
+// hasClaudeAgents so both reads of the same file cost one parse.
+function legacyManifestName(root: string): string | null {
+  const manifestPath = resolveContained(
+    root,
+    join(root, ".claude-plugin", "plugin.json"),
+  );
+  if (!manifestPath) return null;
+  try {
+    const manifest: unknown = cachedRead(
+      "claude-legacy-manifest",
+      manifestPath,
+      (content) => JSON.parse(content),
+    );
+    if (!isPlainObject(manifest)) return null;
+    const { name } = manifest;
+    return typeof name === "string" && validateName(name) ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 // True when a plugin carries flat agent files: agents/<name>.md or bare
 // <name>.md in the root (agency-agents layouts), which readAgents picks up
 // even without a manifest `agents` field.
@@ -545,12 +589,17 @@ export function packageFromDir(
   const skillDirs = new Set<string>();
   findSkillDirs(root, skillDirs, new Set());
   if (skillDirs.size === 0 && !hasClaudeAgents(root) && !hasFlatAgents(root)) return null;
+  // Prefer the plugin's own declared name (native Claude Code manifest, no
+  // $schema) over the directory basename, so mirrors of the same plugin at
+  // different physical paths share an identity dedupePackages can collapse.
+  const declaredName = legacyManifestName(root);
   return {
     source,
     trusted,
-    name: legacyFallbackName(root.split(/[\\/]/).pop() ?? ""),
+    name: declaredName ?? legacyFallbackName(root.split(/[\\/]/).pop() ?? ""),
     root,
     skillDirs: [...skillDirs],
+    manifestName: declaredName !== null,
   };
 }
 
@@ -929,16 +978,19 @@ export function collectNodeModules(
 
 // --- Merge logic ------------------------------------------------------------
 
-// Collapses mirrors of the same conformant package discovered from several
-// places at once (opencode cache + project node_modules + VS Code clone +
-// synced bundle). Conformant packages are identified by their manifest name;
-// legacy packages fall back to source + root, which is unique per location.
+// Collapses mirrors of the same package discovered from several places at
+// once (opencode cache + project node_modules + VS Code clone + synced
+// bundle + a bundled marketplace tree that nests a second copy of a plugin
+// already discovered standalone). Any package with a manifest-declared name
+// -- Agent Plugins schema or a native Claude Code plugin.json -- is
+// identified by that name; packages with no manifest at all fall back to
+// source + root, which is unique per location (see PluginPackage.manifestName).
 function dedupePackages(packages: PluginPackage[]): PluginPackage[] {
   const seen = new Set<string>();
   const out: PluginPackage[] = [];
   for (const pkg of packages) {
-    const id = pkg.schemaVersion
-      ? `conformant:${pkg.name}`
+    const id = pkg.manifestName
+      ? `named:${pkg.name}`
       : `${pkg.source}\u0000${pkg.root}`;
     if (seen.has(id)) continue;
     seen.add(id);
