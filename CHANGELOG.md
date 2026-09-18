@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - Unreleased
+
+### Fixed
+
+- **The same Claude Code plugin registered its skills once per physical
+  location it existed at, instead of once.** `readPackage` only trusts a
+  manifest's declared `name` for identity when the manifest carries a
+  `$schema` matching the Agent Plugins spec — but the native Claude Code
+  plugin manifest shape (`.claude-plugin/plugin.json` with just `name`/
+  `description`/`author`, no `$schema`) is what nearly every real Claude Code
+  plugin actually ships. A plugin in that shape fell through to
+  `packageFromDir`'s legacy tree walk, which named the package after its
+  *directory basename* instead — unique per physical location, so the exact
+  same plugin discovered twice (a top-level clone and the same clone nested
+  again inside a bundled marketplace tree, or a local install alongside an
+  SSH-synced remote mirror) was treated as two unrelated packages, and
+  `dedupePackages` — which only collapses mirrors sharing an identity — had
+  nothing to collapse. Every skill in the plugin was registered once per
+  copy, which is what produced opencode's own "duplicate skill name"
+  warnings at startup and the accompanying context-window bloat (confirmed on
+  a real host: 607 packages discovered under `~/.claude/plugins` and
+  `~/.claude/remote/plugins`, but only 38 distinct plugins — the rest were
+  mirrors of those 38, contributing 6,450 skill directories before dedupe
+  versus 409 after). `packageFromDir` now reads the native manifest's `name`
+  (still validated the same way `readPackage` validates it) and uses it for
+  identity when present, exactly as `readPackage` already does for the
+  schema-bearing shape; a directory with no manifest at all keeps the
+  basename fallback unchanged. The on-disk discovery-root cache is versioned
+  (`discovery-cache.ts`'s `CACHE_VERSION`, bumped 2 → 3), so a warm cache from
+  before this fix is discarded on the next scan rather than continuing to
+  serve packages that predate the new field. See the two new
+  `discovery.test.js` cases for the identity and dedupe behavior.
+
 ## [2.1.0] - 2026-09-14
 
 ### Fixed

@@ -589,6 +589,57 @@ test("packageFromDir: malformed legacy basenames are neutralized, never trusted 
   }
 });
 
+test("packageFromDir: a native Claude Code manifest (.claude-plugin/plugin.json, no $schema) is identified by its declared name, not its directory basename", () => {
+  const root = makeTemp();
+  try {
+    const dir = join(root, "a1b2c3d4e5f6");
+    mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+    writeFileSync(
+      join(dir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "agency-testing", description: "The Agency Testing division" }),
+    );
+    writeSkillDir(join(dir, "skills", "evidence-collector"), "evidence-collector");
+    const pkg = packageFromDir(dir, "claude");
+    assert.ok(pkg);
+    assert.equal(pkg.name, "agency-testing");
+    assert.equal(pkg.manifestName, true);
+    assert.equal(pkg.skillDirs.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("dedupePackages (via planConfig): two mirrors of the same native Claude Code plugin at different physical paths collapse to one, registering its skills once", () => {
+  const root = makeTemp();
+  try {
+    // Mirrors the real bug: the same plugin cloned standalone, and again
+    // nested inside a bundled marketplace tree (or an SSH-synced remote
+    // copy) — same declared name, different root, no $schema anywhere.
+    const standalone = join(root, "c682a3a5c4b85aa5");
+    const nested = join(root, "d8306a73", "ac51b3c8db342eea");
+    for (const dir of [standalone, nested]) {
+      mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+      writeFileSync(
+        join(dir, ".claude-plugin", "plugin.json"),
+        JSON.stringify({ name: "agency-testing" }),
+      );
+      writeSkillDir(join(dir, "skills", "evidence-collector"), "evidence-collector");
+    }
+    const pkgs = [
+      packageFromDir(standalone, "claude"),
+      packageFromDir(nested, "claude"),
+    ];
+    assert.ok(pkgs[0] && pkgs[1]);
+    const plan = planConfig(pkgs);
+    // Without the fix this is 2: opencode would register the same skill
+    // directory identity twice under the same name, which is exactly what
+    // triggers opencode's own "duplicate skill name" warning at load time.
+    assert.equal(plan.skillPaths.length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("findSkillDirs: terminates on a self-referential symlink cycle", (t) => {
   const root = makeTemp();
   try {

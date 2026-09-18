@@ -26,7 +26,15 @@ const CACHE_FILE_NAME = "discovery-root-cache.json";
 // (any JSON-serializable result — readAgents' cache reuses this same store).
 // A version-1 file on disk is now correctly treated as absent rather than
 // misread with the wrong field name.
-const CACHE_VERSION = 2;
+//
+// Bumped from 2 to 3 when PluginPackage gained the required `manifestName`
+// field (see discovery.ts's dedupePackages): a cached entry written before
+// that change serializes packages with no such field, so dedupePackages
+// would silently treat every one of them as unidentified and keep every
+// mirror — exactly the double-registration bug this field exists to fix,
+// just reintroduced via a stale cache. Bumping the version discards those
+// entries so the next scan rebuilds them with the new field.
+const CACHE_VERSION = 3;
 // Mirrors discovery.ts's MAX_WALK_DEPTH: this is a separate, cheaper walk
 // (see fingerprintTree below), but it must bound depth the same way for the
 // same reason — a pathological or cyclic tree must not grow this pass
