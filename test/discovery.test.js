@@ -2475,18 +2475,32 @@ test("readAgents: reads bare <name>.md files in the package root (new agency-age
       join(pkgDir, "engineering-ai-engineer.md"),
       "---\ndescription: AI engineer\n---\nYou build AI.",
     );
-    // Docs and non-agent files in the root must be ignored.
+    // Docs and non-agent files in the root must be ignored, silently: they
+    // never had an agent-shaped frontmatter block to begin with, so an
+    // uppercase or otherwise non-identifier basename (README, CHANGELOG)
+    // must not be reported as an "invalid name".
     writeFileSync(join(pkgDir, "README.md"), "# Not an agent");
+    writeFileSync(join(pkgDir, "CHANGELOG.md"), "# Changelog\n\nNothing yet.");
     writeFileSync(join(pkgDir, "divisions.json"), JSON.stringify({}));
     const pkg = packageFromDir(pkgDir, "vscode");
     assert.ok(pkg, "root-level agent files make the dir a package");
-    const agents = readAgents(pkg);
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let agents;
+    try {
+      agents = readAgents(pkg);
+    } finally {
+      console.error = origError;
+    }
     assert.equal(agents.length, 2);
     const byName = new Map(agents.map((a) => [a.name, a.agent]));
     assert.equal(byName.get("engineering-code-reviewer").prompt, "You are Code Reviewer.");
     assert.equal(byName.get("engineering-code-reviewer").color, "#800080");
     assert.equal(byName.get("engineering-ai-engineer").description, "AI engineer");
     assert.equal(byName.get("README"), undefined, "README.md is not an agent");
+    assert.equal(byName.get("CHANGELOG"), undefined, "CHANGELOG.md is not an agent");
+    assert.equal(logs.length, 0, "non-agent root docs must not log an invalid-name warning");
   } finally {
     cleanup(root);
   }

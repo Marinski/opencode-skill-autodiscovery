@@ -319,14 +319,6 @@ function readAgentsUncached(pkg: PluginPackage): ReadAgentsResult {
     for (const entry of flatEntries) {
       if (!entry.endsWith(".md")) continue;
       const name = entry.slice(0, -".md".length);
-      // Flat agent filenames are package-supplied input: gate the name before
-      // it becomes any config key.
-      if (!validateName(name)) {
-        log(
-          `skipping flat agent file for package "${pkg.name}" (${pkg.source}): invalid name "${name}" (must match the identifier pattern and not be a prototype-chain key)`,
-        );
-        continue;
-      }
       if (out.has(name)) continue;
       // Flat agent files are package-supplied prompt content: only read one
       // when it resolves inside the package, so a symlinked .md cannot pull in
@@ -345,6 +337,16 @@ function readAgentsUncached(pkg: PluginPackage): ReadAgentsResult {
         continue;
       }
       if (!parsed) continue;
+      // Flat agent filenames are package-supplied input: gate the name before
+      // it becomes any config key. Checked only once the file has parsed as
+      // agent-like content, so ordinary root docs (README.md, CHANGELOG.md)
+      // never trip this warning just for having an uppercase name.
+      if (!validateName(name)) {
+        log(
+          `skipping flat agent file for package "${pkg.name}" (${pkg.source}): invalid name "${name}" (must match the identifier pattern and not be a prototype-chain key)`,
+        );
+        continue;
+      }
       const { description, color, body } = parsed;
       if (!description && !body) continue;
       const agent: AgentConfig = {};
