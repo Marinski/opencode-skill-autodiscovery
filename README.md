@@ -74,6 +74,14 @@ logs, or terminal output. Treat a server's headers/env/URL as a static
 snapshot: once mirrored, the value has no rotation or revocation linkage back
 to the package — updating the package does not rotate a copied token.
 
+The classifier flags a header **or env** name that matches the credential name
+rule (a well-known header word such as `authorization`/`token`, or the
+`AUTH`/`_KEY`/`_TOKEN`/`_SECRET`/`_CREDENTIAL`-style suffixes an env var
+carries, e.g. `GITHUB_TOKEN`, `OPENAI_API_KEY`), and a header/env **value**
+that carries a bearer/secret word, a known provider prefix (`sk-`, `ghp_`,
+`xox`), or a high-entropy/base64 token band (a 40-char opaque value counts
+even under an unlisted name like `HUB_ID`).
+
 Guidance:
 
 - **Use https-only remotes.** `streamable-http` servers must already be

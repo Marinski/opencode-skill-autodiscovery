@@ -29,6 +29,7 @@ import {
   readMcp,
   readPackage,
 } from "../dist/discovery.js";
+import { CREDENTIAL_NAME } from "../dist/mcp.js";
 import { fingerprintTree, getCachedPackages } from "../dist/discovery-cache.js";
 import { sanitize } from "../dist/log.js";
 
@@ -1493,6 +1494,89 @@ test("readMcp: credential-free entries produce no warning", () => {
   }
 });
 
+test("credentialHit: env AND header names match the shared name rule; values match prefix and entropy-band detectors", () => {
+  // The exported name rule itself: the spec's suffixes, well-known header
+  // names, and AUTH anywhere, each with word-ish boundaries so ordinary
+  // config names do not qualify.
+  for (const name of [
+    "GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    "CLIENT_SECRET",
+    "USER_CREDENTIAL",
+    "AUTH",
+    "AUTH_HEADER",
+    "Authorization",
+    "X-API-KEY",
+    "bearer",
+    "Cookie",
+  ]) {
+    assert.ok(CREDENTIAL_NAME.test(name), `name rule must match "${name}"`);
+  }
+  for (const name of ["AUTHOR", "AUTHORS", "KEYBOARD", "MONKEY", "MYKEY", "MODE", "REGION"]) {
+    assert.ok(!CREDENTIAL_NAME.test(name), `name rule must not match "${name}"`);
+  }
+
+  const HUB_ID_VALUE = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0"; // exactly 40 chars
+  assert.equal(HUB_ID_VALUE.length, 40);
+
+  const root = makeTemp();
+  try {
+    const pkgDir = makePackage(root, "pkg", [], {
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: {
+        // Spec fixtures: each of these must yield a non-null reason.
+        envgithub: { type: "stdio", command: "npx", env: { GITHUB_TOKEN: "ghp_abcdef1234567890abcdef1234567890" } },
+        envopenai: { type: "stdio", command: "npx", env: { OPENAI_API_KEY: "sk-abcdef1234567890" } },
+        // 40-char opaque token under a name no rule lists: the high-entropy
+        // length band catches the value alone.
+        envaliased: { type: "stdio", command: "npx", env: { HUB_ID: HUB_ID_VALUE } },
+        // The same value under a name the header rule matches: header hit.
+        headergithub: {
+          type: "streamable-http",
+          url: "https://api.example.com/mcp",
+          headers: { GITHUB_TOKEN: "ghp_abcdef1234567890abcdef1234567890" },
+        },
+        // Clean pairs that must stay silent (the new detectors must not
+        // broaden beyond their bands).
+        envclean: { type: "stdio", command: "npx", env: { HUB_URL: "https://hub.example.com", REGION: "eu-west" } },
+        headerclean: { type: "streamable-http", url: "https://api.example.com/mcp", headers: { Accept: "application/json", "X-Trace-Id": "trace-abc123" } },
+      },
+    });
+    const pkg = readPackage(pkgDir, "node_modules");
+
+    const logs = [];
+    const origError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(" "));
+    let out;
+    try {
+      out = [];
+      readMcp(pkg, out);
+    } finally {
+      console.error = origError;
+    }
+
+    const reasons = Object.fromEntries(out.map((e) => [e.key, e.credentialReason]));
+    assert.equal(reasons.envgithub, "declares a credential-looking env name");
+    assert.equal(reasons.envopenai, "declares a credential-looking env name");
+    assert.equal(reasons.envaliased, "declares a credential-looking env value");
+    assert.equal(reasons.headergithub, "declares an Authorization-style header");
+    assert.equal(reasons.envclean, undefined);
+    assert.equal(reasons.headerclean, undefined);
+
+    // Every credential-bearing server warns exactly once; the clean ones stay
+    // silent; the value-only hit names its own reason.
+    const warnServers = logs
+      .filter((l) => /will be stored in opencode's config in plaintext/.test(l))
+      .map((l) => l.match(/MCP server "pkg\/([a-z]+)"/)[1])
+      .sort();
+    assert.deepEqual(warnServers, ["envaliased", "envgithub", "envopenai", "headergithub"]);
+    assert.ok(logs.some((l) => /declares a credential-looking env value/.test(l)));
+    assert.ok(!logs.some((l) => /envclean|headerclean/.test(l)));
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("reject-warn-consent matrix runs together end to end: http rejected, credentials warn per package/server, untrusted gated on consent, clean entries silent", () => {
   const root = makeTemp();
   try {
@@ -1571,7 +1655,7 @@ test("reject-warn-consent matrix runs together end to end: http rejected, creden
       [
         'skipping MCP server "matrixpkg/authed" (node_modules): declares an Authorization-style header; add it to consent.mcp to admit its servers',
         'skipping MCP server "matrixpkg/insecure": remote servers must use https',
-        'skipping MCP server "matrixpkg/localsecret" (node_modules): declares a credential-looking env value; add it to consent.mcp to admit its servers',
+        'skipping MCP server "matrixpkg/localsecret" (node_modules): declares a credential-looking env name; add it to consent.mcp to admit its servers',
         'skipping MCP server "matrixpkg/userinfo" (node_modules): carries an userinfo@ component; add it to consent.mcp to admit its servers',
       ],
     );
@@ -1595,7 +1679,7 @@ test("reject-warn-consent matrix runs together end to end: http rejected, creden
       onWarnings.map((l) => l.replace("[opencode-skill-autodiscovery] ", "")).sort(),
       [
         `MCP server "matrixpkg/authed" declares an Authorization-style header; it will be stored in opencode's config in plaintext`,
-        `MCP server "matrixpkg/localsecret" declares a credential-looking env value; it will be stored in opencode's config in plaintext`,
+        `MCP server "matrixpkg/localsecret" declares a credential-looking env name; it will be stored in opencode's config in plaintext`,
         `MCP server "matrixpkg/userinfo" carries an userinfo@ component; it will be stored in opencode's config in plaintext`,
       ],
     );

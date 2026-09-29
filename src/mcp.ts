@@ -53,13 +53,32 @@ function collectHeaders(value: unknown): Record<string, string> {
 
 // opencode stores config.mcp in plaintext, so credential-looking inputs get a
 // loud warning (never a silent strip - the server needs the real value; the
-// controls are warn + gate + consent). Header names match the well-known
-// credential set case-insensitively; header/env values that visibly contain a
-// bearer/secret pattern qualify; and an http(s) url with an userinfo@
-// component counts too.
+// controls are warn + gate + consent). Header AND env names match the
+// well-known credential set case-insensitively; header/env values that
+// visibly carry a bearer/secret word, a known provider prefix, or a
+// high-entropy/base64 token band qualify; and an http(s) url with an
+// userinfo@ component counts too.
 const CREDENTIAL_HEADER_NAME =
   /\b(authorization|api[-_]?key|token|bearer|apikey|cookie)\b/i;
+// Shared name rule, exported for its test: matches both the well-known
+// header names (authorization, token, ...) and the env-style suffixes a
+// credential env var carries (GITHUB_TOKEN, OPENAI_API_KEY, CLIENT_SECRET,
+// USER_CREDENTIAL), plus AUTH / AUTHORIZATION in any position (AUTH_HEADER).
+// Deliberately a constant next to CREDENTIAL_HEADER_NAME, not a config knob:
+// the detector set is part of the plugin's security posture.
+export const CREDENTIAL_NAME =
+  /(^|[^a-z0-9])(authorization|api[-_]?key|token|bearer|apikey|cookie|auth|key|secret|credential|_token|_credential)([^a-z0-9]|$)/i;
 const CREDENTIAL_VALUE = /(bearer|secret)/i;
+// Known provider token prefixes: sk- (OpenAI-style), ghp_ (GitHub personal
+// access token), xox (Slack: xoxb-, xoxp-, xoxa-...). Unanchored like
+// CREDENTIAL_VALUE: a prefixed token embedded in a longer value still counts.
+const CREDENTIAL_VALUE_PREFIX = /\b(sk-|ghp_|xox)/i;
+// High-entropy/base64 length bands: a dense opaque run long enough that
+// natural-language config values do not reach it. 32-47 and >=56 catch a
+// 40-char token (the band a GitHub-style token lands in) under an unlisted
+// name like HUB_ID, without flagging short ids, version strings, or a
+// dash-separated sentence like "s3cr3t-bearer-value" (each token 8 chars).
+const HIGH_ENTROPY_BAND = /^[A-Za-z0-9+/=_-]{32,47}$|^[A-Za-z0-9+/=_-]{56,}$/;
 const USERINFO_URL = /^[a-z][a-z0-9+.-]*:\/\/[^/?#\s]*@/i;
 
 // Classifies one name/value pair (or a bare url) as credential-like and
@@ -72,10 +91,16 @@ function credentialHit(
   if (kind === "url") {
     return USERINFO_URL.test(name) ? "carries an userinfo@ component" : null;
   }
-  if (kind === "header" && CREDENTIAL_HEADER_NAME.test(name)) {
-    return "declares an Authorization-style header";
+  if (CREDENTIAL_NAME.test(name)) {
+    return kind === "header"
+      ? "declares an Authorization-style header"
+      : "declares a credential-looking env name";
   }
-  if (CREDENTIAL_VALUE.test(value)) {
+  if (
+    CREDENTIAL_VALUE.test(value) ||
+    CREDENTIAL_VALUE_PREFIX.test(value) ||
+    HIGH_ENTROPY_BAND.test(value)
+  ) {
     return kind === "header"
       ? "declares a credential-looking header value"
       : "declares a credential-looking env value";

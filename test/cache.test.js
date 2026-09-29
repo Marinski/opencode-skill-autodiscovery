@@ -1,6 +1,6 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _resetFileCacheForTests, cachedRead, flushFileCache } from "../dist/cache.js";
@@ -116,4 +116,66 @@ test("cachedRead: a corrupt on-disk cache degrades to a fresh read, never throws
   const file = join(envRoot, "f.txt");
   writeFileSync(file, "still works");
   assert.equal(cachedRead("id", file, (c) => c), "still works");
+});
+
+test("cachedRead: a stale-versioned on-disk cache is rejected, never misread", () => {
+  const cacheDir = join(envRoot, ".cache", "opencode-skill-autodiscovery");
+  mkdirSync(cacheDir, { recursive: true });
+  const file = join(envRoot, "g.txt");
+  writeFileSync(file, "fresh");
+  const key = JSON.stringify(["id", file]);
+  // Stale-versioned file: same key, stale value, but a version the running
+  // code no longer recognizes. loadStore must discard the whole store rather
+  // than serve the stale value — this is exactly the class of bug that once
+  // reintroduced double-registration through a stale on-disk cache.
+  writeFileSync(
+    join(cacheDir, "discovery-file-cache.json"),
+    JSON.stringify({
+      version: "stale-not-a-number",
+      entries: { [key]: { mtimeMs: 0, size: 0, value: "stale" } },
+    }),
+  );
+  assert.equal(
+    cachedRead("id", file, (c) => c),
+    "fresh",
+    "a stale-versioned cache must never be served; the file is re-read",
+  );
+  // And the rejected store is what persists now: flush + reload sees fresh.
+  flushFileCache();
+  _resetFileCacheForTests();
+  assert.equal(cachedRead("id", file, (c) => c), "fresh");
+});
+
+test("credential reasons are never a cached value shape: no CACHE_VERSION bump needed for the credentialHit detectors", () => {
+  // credentialHit's reasons (env/header name + value classification) feed
+  // only McpPlanEntry.credentialReason, which planConfig consumes transiently
+  // for log lines. Neither on-disk cache persists them: the per-file cache
+  // holds file-parse results, the walk cache holds package/agent results. A
+  // changed reason therefore cannot be served stale, and the version bump
+  // those caches carry stays where its comments scope it: cached-shape
+  // changes only. If a future change ever caches plan output or reason fields,
+  // this test must be replaced by bumping the owning CACHE_VERSION.
+  const cacheDir = join(envRoot, ".cache", "opencode-skill-autodiscovery");
+  mkdirSync(cacheDir, { recursive: true });
+  const file = join(envRoot, "h.txt");
+  writeFileSync(file, JSON.stringify("v1"));
+  assert.deepEqual(cachedRead("plugin-manifest", file, (c) => JSON.parse(c)), "v1");
+  flushFileCache();
+
+  const cacheFile = join(cacheDir, "discovery-file-cache.json");
+  const payload = JSON.parse(readFileSync(cacheFile, "utf8"));
+  const manifestKey = JSON.stringify(["plugin-manifest", file]);
+  assert.equal(payload.entries[manifestKey].value, "v1");
+  assert.ok(
+    !JSON.stringify(payload).includes("credential"),
+    "no credential reason may appear in any cached value",
+  );
+
+  // The same check for the walk cache: it is keyed by fingerprint, and its
+  // values are package/agent results, never credential classifications.
+  assert.ok(
+    !existsSync(join(cacheDir, "discovery-root-cache.json")) ||
+      !JSON.stringify(JSON.parse(readFileSync(join(cacheDir, "discovery-root-cache.json"), "utf8"))).includes("credential"),
+    "no credential reason may appear in the walk cache either",
+  );
 });

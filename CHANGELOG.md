@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.1.1] - Unreleased
 
+### Added
+
+- **`credentialHit` now inspects env *and* header names, plus stronger value
+  signals.** The name check is one exported constant (`CREDENTIAL_NAME`, in
+  `mcp.ts` next to `CREDENTIAL_HEADER_NAME`, deliberately not a config knob):
+  it matches well-known header words *and* the `AUTH`/`_KEY`/`_TOKEN`/
+  `_SECRET`/`_CREDENTIAL`-style suffixes an env var carries, so
+  `GITHUB_TOKEN` or `OPENAI_API_KEY` is flagged by its name alone. The value
+  check gains known provider prefixes (`sk-`, `ghp_`, `xox`) and a high-
+  entropy/base64 length band, so a 40-char opaque token is flagged even under
+  an unlisted name like `HUB_ID`. No on-disk cache persists these reasons
+  (`credentialReason` is consumed transiently inside `planConfig`), so no
+  `CACHE_VERSION` bump was needed; a `cache.test.js` regression test pins that
+  invariant and confirms a stale-versioned cache is rejected rather than
+  misread. See the new `discovery.test.js` credentialHit case for the
+  detection matrix.
+
 ### Fixed
 
 - **The same Claude Code plugin registered its skills once per physical
