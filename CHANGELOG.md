@@ -4,24 +4,7 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.1] - Unreleased
-
-### Added
-
-- **`credentialHit` now inspects env *and* header names, plus stronger value
-  signals.** The name check is one exported constant (`CREDENTIAL_NAME`, in
-  `mcp.ts` next to `CREDENTIAL_HEADER_NAME`, deliberately not a config knob):
-  it matches well-known header words *and* the `AUTH`/`_KEY`/`_TOKEN`/
-  `_SECRET`/`_CREDENTIAL`-style suffixes an env var carries, so
-  `GITHUB_TOKEN` or `OPENAI_API_KEY` is flagged by its name alone. The value
-  check gains known provider prefixes (`sk-`, `ghp_`, `xox`) and a high-
-  entropy/base64 length band, so a 40-char opaque token is flagged even under
-  an unlisted name like `HUB_ID`. No on-disk cache persists these reasons
-  (`credentialReason` is consumed transiently inside `planConfig`), so no
-  `CACHE_VERSION` bump was needed; a `cache.test.js` regression test pins that
-  invariant and confirms a stale-versioned cache is rejected rather than
-  misread. See the new `discovery.test.js` credentialHit case for the
-  detection matrix.
+## [2.1.1] - 2026-09-18
 
 ### Fixed
 
@@ -53,6 +36,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before this fix is discarded on the next scan rather than continuing to
   serve packages that predate the new field. See the two new
   `discovery.test.js` cases for the identity and dedupe behavior.
+
+## [2.1.2] - 2026-10-05
+
+### Added
+
+- **`credentialHit` now inspects env *and* header names, plus stronger value
+  signals.** The name check is one exported constant (`CREDENTIAL_NAME`, in
+  `mcp.ts` next to `CREDENTIAL_HEADER_NAME`, deliberately not a config knob):
+  it matches well-known header words *and* the `AUTH`/`_KEY`/`_TOKEN`/
+  `_SECRET`/`_CREDENTIAL`-style suffixes an env var carries, so
+  `GITHUB_TOKEN` or `OPENAI_API_KEY` is flagged by its name alone. The value
+  check gains known provider prefixes (`sk-`, `ghp_`, `xox`) and a high-
+  entropy/base64 length band, so a 40-char opaque token is flagged even under
+  an unlisted name like `HUB_ID`. No on-disk cache persists these reasons
+  (`credentialReason` is consumed transiently inside `planConfig`), so no
+  `CACHE_VERSION` bump was needed; a `cache.test.js` regression test pins that
+  invariant and confirms a stale-versioned cache is rejected rather than
+  misread. See the new `discovery.test.js` credentialHit case for the
+  detection matrix.
+
+### Fixed
+
+- **Root-level package docs no longer log a spurious "invalid name" warning.**
+  Flat `*.md` scanning validated the candidate agent name (and logged the
+  error) before checking whether the file was agent-shaped at all. An ordinary
+  `README.md`, `CHANGELOG.md`, `AGENTS.md`, `GLOSSARY.md` or `CLAUDE.md` in a
+  package root failed the identifier pattern and was reported on every scan,
+  even though it was never going to register as an agent. The checks are
+  reordered so a root-level file is parsed first; only a file that actually
+  carries an agent frontmatter block but has an invalid filename now trips the
+  warning (`#4`).
 
 ## [2.1.0] - 2026-09-14
 
@@ -164,5 +178,7 @@ This release contains a breaking change, so the major version is bumped from
   that enabling `mcp` or `agents` trusts every discovered package with matching
   executable config, and recommends pairing those flags with `exclude`.
 
+[2.1.2]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v2.1.1...v2.1.2
+[2.1.1]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Marinski/opencode-skill-autodiscovery/compare/v1.4.0...v2.0.0
